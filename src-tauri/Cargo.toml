@@ -1,0 +1,22 @@
+[package]
+name = "imageresizer"
+version = "0.1.0"
+description = "Desktop batch image compression tool"
+edition = "2024"
+
+[lib]
+name = "imageresizer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", features = ["jpeg", "png", "webp", "gif"] }
+rayon = "1.10"
+walkdir = "2"
+dirs = "5"
