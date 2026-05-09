@@ -1,7 +1,7 @@
 <script lang="ts">
   import { profilesStore } from "../stores/profiles";
   import { open } from "@tauri-apps/plugin-dialog";
-  import type { OutputOperation, OutputFormat } from "../types";
+  import type { OutputOperation, OutputFormat, NamingMode } from "../types";
 
   const { activeProfile } = profilesStore;
 
@@ -17,6 +17,12 @@
     { label: "PNG (.png)", value: "Png" },
     { label: "WebP (.webp)", value: "WebP" },
     { label: "GIF (.gif)", value: "Gif" },
+  ];
+
+  const namingModes: { label: string; value: NamingMode; desc: string }[] = [
+    { label: "保持原文件名", value: "KeepOriginal", desc: "输出文件名与原文件相同（格式不同时无需后缀）" },
+    { label: "添加日期后缀", value: "DateSuffix", desc: "如 photo_20260425.jpg" },
+    { label: "自定义后缀", value: "CustomSuffix", desc: "如 photo_min.jpg" },
   ];
 
   function updateOutput(partial: Record<string, any>) {
@@ -77,6 +83,31 @@
         {/each}
       </select>
     </div>
+    {#if $activeProfile.output.operation !== "Overwrite"}
+      <div class="field-row">
+        <label>命名:</label>
+        <select
+          value={$activeProfile.output.naming}
+          onchange={(e) => updateOutput({ naming: (e.target as HTMLSelectElement).value })}
+        >
+          {#each namingModes as nm}
+            <option value={nm.value} title={nm.desc}>{nm.label}</option>
+          {/each}
+        </select>
+      </div>
+      {#if $activeProfile.output.naming === "CustomSuffix"}
+        <div class="field-row">
+          <label>后缀:</label>
+          <input
+            type="text"
+            placeholder="如 _min、_compressed"
+            value={$activeProfile.output.custom_suffix ?? ""}
+            oninput={(e) => updateOutput({ custom_suffix: (e.target as HTMLInputElement).value || null })}
+            class="suffix-input"
+          />
+        </div>
+      {/if}
+    {/if}
   </div>
 {/if}
 
@@ -108,6 +139,14 @@
     font-size: 13px;
     background: var(--bg-secondary);
     flex: 1;
+  }
+  input.suffix-input {
+    flex: 1;
+    padding: 3px 6px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 13px;
+    background: var(--bg-secondary);
   }
   .dir-input {
     flex: 1;

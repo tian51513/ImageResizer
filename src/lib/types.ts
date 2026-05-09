@@ -20,10 +20,13 @@ export interface OutputSettings {
   operation: OutputOperation;
   custom_dir: string | null;
   format: OutputFormat;
+  naming: NamingMode;
+  custom_suffix: string | null;
 }
 
 export type OutputOperation = "Overwrite" | "SameDir" | "CustomDir";
 export type OutputFormat = "SameAsOriginal" | "Jpeg" | "Png" | "WebP" | "Gif";
+export type NamingMode = "KeepOriginal" | "CustomSuffix" | "DateSuffix";
 
 export interface QualitySettings {
   mode: QualityMode;
@@ -48,6 +51,8 @@ export interface ProgressEvent {
   original_size: number;
   new_size: number;
   status: string;
+  total_original_bytes: number;
+  processed_bytes: number;
 }
 
 export interface BatchResult {

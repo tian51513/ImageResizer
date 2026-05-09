@@ -35,6 +35,13 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum NamingMode {
+    KeepOriginal,
+    CustomSuffix,
+    DateSuffix,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum QualityMode {
     Quality,
     TargetSize,
@@ -57,6 +64,8 @@ pub struct OutputSettings {
     pub operation: OutputOperation,
     pub custom_dir: Option<String>,
     pub format: OutputFormat,
+    pub naming: NamingMode,
+    pub custom_suffix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -99,6 +108,8 @@ pub struct ProgressEvent {
     pub original_size: u64,
     pub new_size: u64,
     pub status: String,
+    pub total_original_bytes: u64,
+    pub processed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,6 +173,8 @@ impl ConfigManager {
                     operation: OutputOperation::SameDir,
                     custom_dir: None,
                     format: OutputFormat::SameAsOriginal,
+                    naming: NamingMode::DateSuffix,
+                    custom_suffix: None,
                 },
                 quality: QualitySettings {
                     mode: QualityMode::Quality,
@@ -184,6 +197,8 @@ impl ConfigManager {
                     operation: OutputOperation::CustomDir,
                     custom_dir: None,
                     format: OutputFormat::SameAsOriginal,
+                    naming: NamingMode::KeepOriginal,
+                    custom_suffix: None,
                 },
                 quality: QualitySettings {
                     mode: QualityMode::Quality,
@@ -206,6 +221,8 @@ impl ConfigManager {
                     operation: OutputOperation::SameDir,
                     custom_dir: None,
                     format: OutputFormat::WebP,
+                    naming: NamingMode::DateSuffix,
+                    custom_suffix: None,
                 },
                 quality: QualitySettings {
                     mode: QualityMode::Quality,
@@ -271,6 +288,8 @@ mod tests {
                 operation: OutputOperation::CustomDir,
                 custom_dir: Some("C:\\output".to_string()),
                 format: OutputFormat::Jpeg,
+                naming: NamingMode::CustomSuffix,
+                custom_suffix: Some("_mini".to_string()),
             },
             quality: QualitySettings {
                 mode: QualityMode::TargetSize,

@@ -2,18 +2,31 @@
   import { progressStore } from "../stores/progress";
   import { formatFileSize, formatSavings } from "../utils/format";
 
-  const { isProcessing, current, total, results, batchResult, percentage, totalSaved } = progressStore;
+  const { isProcessing, current, total, percentage, bytePercentage, totalOriginalBytes, processedBytes, results, batchResult, totalSaved } = progressStore;
 </script>
 
 <div class="progress-panel">
   <div class="section-title">处理进度</div>
 
   {#if $isProcessing || $percentage > 0}
-    <div class="progress-bar-container">
-      <div class="progress-bar" style="width: {$percentage}%"></div>
+    <div class="progress-group">
+      <div class="progress-row">
+        <span class="progress-label">文件进度:</span>
+        <span class="progress-value">{$current}/{$total}</span>
+      </div>
+      <div class="progress-bar-container">
+        <div class="progress-bar" style="width: {$percentage}%"></div>
+      </div>
     </div>
-    <div class="progress-text">
-      {$percentage}% ({$current}/{$total})
+
+    <div class="progress-group">
+      <div class="progress-row">
+        <span class="progress-label">总任务进度:</span>
+        <span class="progress-value">{$bytePercentage}% · {formatFileSize($processedBytes)} / {formatFileSize($totalOriginalBytes)}</span>
+      </div>
+      <div class="progress-bar-container">
+        <div class="progress-bar progress-bar-total" style="width: {$bytePercentage}%"></div>
+      </div>
     </div>
   {/if}
 
@@ -25,22 +38,20 @@
         <span class="col-size">压缩后</span>
         <span class="col-saving">节省</span>
       </div>
-      <div class="table-body">
-        {#each $results.slice(-50) as result (result.file)}
-          <div class="table-row" class:failed={result.status !== "success"}>
-            <span class="col-file" title={result.file}>
-              {result.file.split(/[/\\]/).slice(-2).join("/")}
-            </span>
-            <span class="col-size">{formatFileSize(result.original_size)}</span>
-            <span class="col-size">
-              {result.status === "success" ? formatFileSize(result.new_size) : result.status}
-            </span>
-            <span class="col-saving" class:grew={result.new_size >= result.original_size && result.status === "success"}>
-              {result.status === "success" ? formatSavings(result.original_size, result.new_size) : "-"}
-            </span>
-          </div>
-        {/each}
-      </div>
+      {#each $results.slice(-100) as result (result.file)}
+        <div class="table-row" class:failed={result.status !== "success"} class:skipped={result.status === "skipped"}>
+          <span class="col-file" title={result.file}>
+            {result.file.split(/[/\\]/).slice(-2).join("/")}
+          </span>
+          <span class="col-size">{formatFileSize(result.original_size)}</span>
+          <span class="col-size" class:status-cell={result.status !== "success"} title={result.status !== "success" ? result.status : ''}>
+            {result.status === "success" ? formatFileSize(result.new_size) : result.status}
+          </span>
+          <span class="col-saving" class:grew={result.new_size >= result.original_size && result.status === "success"}>
+            {result.status === "success" ? formatSavings(result.original_size, result.new_size) : "-"}
+          </span>
+        </div>
+      {/each}
     </div>
   {/if}
 
@@ -61,6 +72,11 @@
         <strong>{formatFileSize($totalSaved)}</strong>
       </div>
     </div>
+    {#if $batchResult.failed > 0}
+      <div class="log-hint" title="日志文件路径">
+        日志路径: {exe所在目录}\logs\{日期}.log
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -76,27 +92,39 @@
     padding-bottom: 4px;
     border-bottom: 1px solid var(--border-color);
   }
+  .progress-group {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .progress-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .progress-value {
+    font-variant-numeric: tabular-nums;
+  }
   .progress-bar-container {
-    height: 20px;
+    height: 16px;
     background: var(--border-color);
-    border-radius: 10px;
+    border-radius: 8px;
     overflow: hidden;
   }
   .progress-bar {
     height: 100%;
     background: var(--accent);
-    border-radius: 10px;
+    border-radius: 8px;
     transition: width 0.3s ease;
   }
-  .progress-text {
-    font-size: 12px;
-    color: var(--text-secondary);
-    text-align: center;
+  .progress-bar-total {
+    background: #4ade80;
   }
   .results-table {
     border: 1px solid var(--border-color);
     border-radius: 4px;
-    max-height: 200px;
+    max-height: 300px;
     overflow-y: auto;
   }
   .table-header {
@@ -108,10 +136,7 @@
     border-bottom: 1px solid var(--border-color);
     position: sticky;
     top: 0;
-  }
-  .table-body {
-    max-height: 160px;
-    overflow-y: auto;
+    z-index: 1;
   }
   .table-row {
     display: flex;
@@ -121,6 +146,15 @@
   }
   .table-row.failed {
     color: var(--error);
+  }
+  .table-row.skipped {
+    color: var(--text-secondary);
+  }
+  .col-size.status-cell {
+    cursor: help;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .table-row:last-child {
     border-bottom: none;
@@ -160,5 +194,12 @@
   }
   .has-failures {
     color: var(--error);
+  }
+  .log-hint {
+    font-size: 11px;
+    color: var(--text-secondary);
+    padding: 4px 0;
+    cursor: default;
+    word-break: break-all;
   }
 </style>

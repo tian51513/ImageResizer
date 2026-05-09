@@ -1,9 +1,10 @@
 use crate::config::*;
 use image::imageops::FilterType;
+use image::io::Reader as ImageReader;
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct ImageProcessor;
@@ -16,8 +17,39 @@ impl ImageProcessor {
         profile: &Profile,
     ) -> Result<ProcessResult, String> {
         let input = Path::new(input_path);
-        let img = image::open(input)
-            .map_err(|e| format!("Failed to open {}: {}", input_path, e))?;
+        log::info!("Processing file: {}", input_path);
+
+        let img = ImageReader::open(input)
+            .map_err(|e| {
+                log::error!("Failed to open {}: {}", input_path, e);
+                format!("Failed to open {}: {}", input_path, e)
+            })?
+            .with_guessed_format()
+            .map_err(|e| {
+                log::error!("Failed to detect format for {}: {}", input_path, e);
+                format!("Failed to detect format for {}: {}", input_path, e)
+            })?
+            .decode()
+            .map_err(|e| {
+                log::error!("Failed to decode {}: {}", input_path, e);
+                format!("Failed to decode {}: {}", input_path, e)
+            })?;
+
+        let (orig_w, orig_h) = img.dimensions();
+        let color = match &img {
+            DynamicImage::ImageRgb8(_) => "RGB8",
+            DynamicImage::ImageRgba8(_) => "RGBA8",
+            DynamicImage::ImageRgb16(_) => "RGB16",
+            DynamicImage::ImageRgba16(_) => "RGBA16",
+            DynamicImage::ImageRgb32F(_) => "RGB32F",
+            DynamicImage::ImageRgba32F(_) => "RGBA32F",
+            DynamicImage::ImageLuma8(_) => "Luma8",
+            DynamicImage::ImageLumaA8(_) => "LumaA8",
+            DynamicImage::ImageLuma16(_) => "Luma16",
+            DynamicImage::ImageLumaA16(_) => "LumaA16",
+            _ => "Unknown",
+        };
+        log::info!("  Image: {}x{}, color={}", orig_w, orig_h, color);
 
         let original_size = std::fs::metadata(input_path)
             .map(|m| m.len())
@@ -29,11 +61,15 @@ impl ImageProcessor {
         // Ensure output directory exists
         if let Some(parent) = Path::new(output_path).parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create output dir: {}", e))?;
+                .map_err(|e| {
+                    log::error!("Failed to create output dir: {}", e);
+                    format!("Failed to create output dir: {}", e)
+                })?;
         }
 
         // Determine effective format
         let effective_format = Self::effective_format(input_path, &profile.output.format);
+        log::info!("  Output format: {:?}, path: {}", effective_format, output_path);
 
         // Encode and save
         Self::encode_and_save(&resized, output_path, effective_format, &profile.quality)?;
@@ -41,6 +77,12 @@ impl ImageProcessor {
         let new_size = std::fs::metadata(output_path)
             .map(|m| m.len())
             .unwrap_or(0);
+        log::info!(
+            "  Done: {} -> {} bytes (saved {} bytes)",
+            original_size,
+            new_size,
+            original_size.saturating_sub(new_size)
+        );
 
         Ok(ProcessResult {
             file: input_path.to_string(),
@@ -137,44 +179,104 @@ impl ImageProcessor {
     ) -> Result<(), String> {
         let quality = match quality_settings.mode {
             QualityMode::Original => {
-                img.save_with_format(path, format)
-                    .map_err(|e| format!("Save error: {}", e))?;
+                let compatible = Self::ensure_compatible_color(img, format);
+                log::info!("  Saving with original quality as {:?}", format);
+                compatible
+                    .save_with_format(path, format)
+                    .map_err(|e| {
+                        log::error!("Save error ({}): {}", path, e);
+                        format!("Save error: {}", e)
+                    })?;
                 return Ok(());
             }
             QualityMode::Quality => quality_settings.quality.max(1).min(100),
             QualityMode::TargetSize => {
                 let target_kb = quality_settings.target_size_kb.unwrap_or(100);
+                log::info!("  Saving with target size: {}KB", target_kb);
                 return Self::save_with_target_size(img, path, format, target_kb);
             }
         };
 
         match format {
             ImageFormat::Jpeg => {
+                // JPEG does not support alpha — convert RGBA to RGB first
+                let rgb_img = img.to_rgb8();
+                log::info!("  Encoding JPEG quality={}", quality);
                 let mut buf = Vec::new();
                 let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-                img.write_with_encoder(encoder)
-                    .map_err(|e| format!("JPEG encode error: {}", e))?;
-                std::fs::write(path, buf)
-                    .map_err(|e| format!("JPEG write error: {}", e))?;
+                rgb_img
+                    .write_with_encoder(encoder)
+                    .map_err(|e| {
+                        log::error!("JPEG encode error: {}", e);
+                        format!("JPEG encode error: {}", e)
+                    })?;
+                std::fs::write(path, buf).map_err(|e| {
+                    log::error!("JPEG write error: {}", e);
+                    format!("JPEG write error: {}", e)
+                })?;
             }
             ImageFormat::Png => {
-                img.save_with_format(path, ImageFormat::Png)
-                    .map_err(|e| format!("PNG save error: {}", e))?;
+                let compatible = Self::ensure_compatible_color(img, format);
+                log::info!("  Encoding PNG");
+                compatible
+                    .save_with_format(path, ImageFormat::Png)
+                    .map_err(|e| {
+                        log::error!("PNG save error: {}", e);
+                        format!("PNG save error: {}", e)
+                    })?;
             }
             ImageFormat::WebP => {
-                img.save_with_format(path, ImageFormat::WebP)
-                    .map_err(|e| format!("WebP save error: {}", e))?;
+                // WebP encoder needs 8-bit color — downconvert if needed
+                let compatible = Self::ensure_compatible_color(img, format);
+                log::info!("  Encoding WebP");
+                compatible
+                    .save_with_format(path, ImageFormat::WebP)
+                    .map_err(|e| {
+                        log::error!("WebP save error: {}", e);
+                        format!("WebP save error: {}", e)
+                    })?;
             }
             ImageFormat::Gif => {
-                img.save_with_format(path, ImageFormat::Gif)
-                    .map_err(|e| format!("GIF save error: {}", e))?;
+                // GIF needs RGB8 or RGBA8 — downconvert 16-bit images
+                let compatible = Self::ensure_compatible_color(img, format);
+                log::info!("  Encoding GIF");
+                compatible
+                    .save_with_format(path, ImageFormat::Gif)
+                    .map_err(|e| {
+                        log::error!("GIF save error: {}", e);
+                        format!("GIF save error: {}", e)
+                    })?;
             }
             _ => {
-                img.save_with_format(path, format)
-                    .map_err(|e| format!("Save error: {}", e))?;
+                let compatible = Self::ensure_compatible_color(img, format);
+                compatible
+                    .save_with_format(path, format)
+                    .map_err(|e| {
+                        log::error!("Save error: {}", e);
+                        format!("Save error: {}", e)
+                    })?;
             }
         }
         Ok(())
+    }
+
+    /// Ensure image color type is compatible with the target format.
+    /// Downconverts 16-bit to 8-bit and removes alpha for JPEG.
+    fn ensure_compatible_color(img: &DynamicImage, format: ImageFormat) -> DynamicImage {
+        // JPEG needs RGB (no alpha, no 16-bit)
+        if format == ImageFormat::Jpeg {
+            return img.to_rgb8().into();
+        }
+        // For all other formats, ensure 8-bit (WebP/GIF/PNG encoders may fail on 16-bit)
+        match img {
+            DynamicImage::ImageRgb16(_) => img.to_rgb8().into(),
+            DynamicImage::ImageRgba16(_) => img.to_rgba8().into(),
+            DynamicImage::ImageRgb32F(_) => img.to_rgb8().into(),
+            DynamicImage::ImageRgba32F(_) => img.to_rgba8().into(),
+            DynamicImage::ImageLuma16(_) => img.to_luma8().into(),
+            DynamicImage::ImageLumaA16(_) => img.to_luma_alpha8().into(),
+            _ => img.clone(),
+        }
     }
 
     /// Binary search for quality that meets target file size
@@ -185,6 +287,7 @@ impl ImageProcessor {
         target_kb: u32,
     ) -> Result<(), String> {
         let target_bytes = (target_kb as u64) * 1024;
+        let rgb_img = img.to_rgb8();
 
         match format {
             ImageFormat::Jpeg => {
@@ -197,7 +300,7 @@ impl ImageProcessor {
                     let mut buf = Vec::new();
                     let encoder =
                         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, mid);
-                    let _ = img.write_with_encoder(encoder);
+                    let _ = rgb_img.write_with_encoder(encoder);
 
                     if buf.len() as u64 > target_bytes {
                         high = mid - 1;
@@ -211,21 +314,59 @@ impl ImageProcessor {
                     let mut buf = Vec::new();
                     let encoder =
                         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 1);
-                    img.write_with_encoder(encoder)
-                        .map_err(|e| format!("JPEG encode error: {}", e))?;
-                    std::fs::write(path, buf)
-                        .map_err(|e| format!("JPEG write error: {}", e))?;
+                    rgb_img
+                        .write_with_encoder(encoder)
+                        .map_err(|e| {
+                            log::error!("JPEG encode error: {}", e);
+                            format!("JPEG encode error: {}", e)
+                        })?;
+                    std::fs::write(path, buf).map_err(|e| {
+                        log::error!("JPEG write error: {}", e);
+                        format!("JPEG write error: {}", e)
+                    })?;
                 } else {
-                    std::fs::write(path, best_buf)
-                        .map_err(|e| format!("JPEG write error: {}", e))?;
+                    std::fs::write(path, best_buf).map_err(|e| {
+                        log::error!("JPEG write error: {}", e);
+                        format!("JPEG write error: {}", e)
+                    })?;
                 }
             }
             _ => {
-                img.save_with_format(path, format)
-                    .map_err(|e| format!("Save error: {}", e))?;
+                let compatible = Self::ensure_compatible_color(img, format);
+                compatible
+                    .save_with_format(path, format)
+                    .map_err(|e| {
+                        log::error!("Save error (target size): {}", e);
+                        format!("Save error: {}", e)
+                    })?;
             }
         }
         Ok(())
+    }
+
+    /// Build the filename stem (without extension) with appropriate suffix applied.
+    fn build_filename_stem(
+        stem: &str,
+        _original_ext: &str,
+        _target_ext: &str,
+        naming: &NamingMode,
+        custom_suffix: &Option<String>,
+    ) -> String {
+        match naming {
+            NamingMode::CustomSuffix => {
+                let suffix = custom_suffix.as_deref().unwrap_or("");
+                if suffix.is_empty() {
+                    stem.to_string()
+                } else {
+                    format!("{}{}", stem, suffix)
+                }
+            }
+            NamingMode::DateSuffix => {
+                let date_suffix = chrono::Local::now().format("_%Y%m%d").to_string();
+                format!("{}{}", stem, date_suffix)
+            }
+            NamingMode::KeepOriginal => stem.to_string(),
+        }
     }
 
     /// Compute output file path based on operation mode
@@ -235,12 +376,20 @@ impl ImageProcessor {
         output_settings: &OutputSettings,
     ) -> String {
         let path = Path::new(file_path);
-        let ext = match &output_settings.format {
-            OutputFormat::SameAsOriginal => path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("jpg")
-                .to_string(),
+        let original_ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let target_ext = match &output_settings.format {
+            OutputFormat::SameAsOriginal => {
+                if original_ext.is_empty() {
+                    "jpg".to_string()
+                } else {
+                    original_ext.clone()
+                }
+            }
             OutputFormat::Jpeg => "jpg".to_string(),
             OutputFormat::Png => "png".to_string(),
             OutputFormat::WebP => "webp".to_string(),
@@ -255,7 +404,14 @@ impl ImageProcessor {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let new_name = format!("{}_compressed.{}", stem, ext);
+                let new_stem = Self::build_filename_stem(
+                    &stem,
+                    &original_ext,
+                    &target_ext,
+                    &output_settings.naming,
+                    &output_settings.custom_suffix,
+                );
+                let new_name = format!("{}.{}", new_stem, target_ext);
                 path.parent()
                     .unwrap_or(path)
                     .join(new_name)
@@ -274,10 +430,17 @@ impl ImageProcessor {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
+                let new_stem = Self::build_filename_stem(
+                    &stem,
+                    &original_ext,
+                    &target_ext,
+                    &output_settings.naming,
+                    &output_settings.custom_suffix,
+                );
                 let new_relative = relative
                     .parent()
-                    .map(|p| p.join(format!("{}.{}", stem, ext)))
-                    .unwrap_or_else(|| PathBuf::from(format!("{}.{}", stem, ext)));
+                    .map(|p| p.join(format!("{}.{}", new_stem, target_ext)))
+                    .unwrap_or_else(|| PathBuf::from(format!("{}.{}", new_stem, target_ext)));
                 Path::new(custom_dir)
                     .join(new_relative)
                     .to_string_lossy()
@@ -295,11 +458,15 @@ impl ImageProcessor {
         progress_callback: impl Fn(ProgressEvent) + Send + Sync,
     ) -> BatchResult {
         let total = files.len() as u32;
+        let total_original_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
+        let processed_bytes = Arc::new(AtomicU64::new(0));
+
         let results: Vec<ProcessResult> = files
             .par_iter()
             .enumerate()
             .filter_map(|(i, file)| {
                 if stop_flag.load(Ordering::Relaxed) {
+                    processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed);
                     return Some(ProcessResult {
                         file: file.path.clone(),
                         original_size: file.size_bytes,
@@ -313,13 +480,18 @@ impl ImageProcessor {
 
                 let result = match Self::process_file(&file.path, &output_path, profile) {
                     Ok(r) => r,
-                    Err(e) => ProcessResult {
-                        file: file.path.clone(),
-                        original_size: file.size_bytes,
-                        new_size: 0,
-                        status: format!("failed: {}", e),
-                    },
+                    Err(e) => {
+                        log::error!("FAILED [{}]: {}", file.path, e);
+                        ProcessResult {
+                            file: file.path.clone(),
+                            original_size: file.size_bytes,
+                            new_size: 0,
+                            status: format!("failed: {}", e),
+                        }
+                    }
                 };
+
+                let bytes = processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed) + file.size_bytes;
 
                 progress_callback(ProgressEvent {
                     total,
@@ -328,6 +500,8 @@ impl ImageProcessor {
                     original_size: result.original_size,
                     new_size: result.new_size,
                     status: result.status.clone(),
+                    total_original_bytes,
+                    processed_bytes: bytes,
                 });
 
                 Some(result)
@@ -464,6 +638,8 @@ mod tests {
             operation: OutputOperation::SameDir,
             custom_dir: None,
             format: OutputFormat::SameAsOriginal,
+            naming: NamingMode::DateSuffix,
+            custom_suffix: None,
         };
 
         let output = ImageProcessor::compute_output_path(
@@ -472,8 +648,154 @@ mod tests {
             &settings,
         );
 
-        assert!(output.contains("_compressed"));
+        assert!(!output.contains("_compressed"));
         assert!(output.ends_with(".jpg"));
+        let filename = std::path::Path::new(&output)
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert_ne!(filename.to_string(), "001.jpg");
+    }
+
+    #[test]
+    fn test_compute_output_path_same_dir_date_suffix() {
+        let settings = OutputSettings {
+            operation: OutputOperation::SameDir,
+            custom_dir: None,
+            format: OutputFormat::SameAsOriginal,
+            naming: NamingMode::DateSuffix,
+            custom_suffix: None,
+        };
+
+        let output = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+
+        assert!(output.contains("001_20260425") || output.contains("001_2026"));
+        assert!(output.ends_with(".jpg"));
+        assert!(!output.contains("_compressed"));
+    }
+
+    #[test]
+    fn test_compute_output_path_same_dir_custom_suffix() {
+        let settings = OutputSettings {
+            operation: OutputOperation::SameDir,
+            custom_dir: None,
+            format: OutputFormat::SameAsOriginal,
+            naming: NamingMode::CustomSuffix,
+            custom_suffix: Some("_mini".to_string()),
+        };
+
+        let output = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+
+        assert!(output.contains("001_mini"));
+        assert!(output.ends_with(".jpg"));
+    }
+
+    #[test]
+    fn test_compute_output_path_same_dir_keep_original() {
+        let settings = OutputSettings {
+            operation: OutputOperation::SameDir,
+            custom_dir: None,
+            format: OutputFormat::Jpeg,
+            naming: NamingMode::KeepOriginal,
+            custom_suffix: None,
+        };
+
+        let output = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.png",
+            "C:\\comics",
+            &settings,
+        );
+
+        // KeepOriginal + format change → different extension, no suffix needed
+        assert!(output.contains("001.jpg"));
+        assert!(!output.contains("_compressed"));
+    }
+
+    #[test]
+    fn test_compute_output_path_same_dir_keep_original_no_suffix() {
+        let settings = OutputSettings {
+            operation: OutputOperation::SameDir,
+            custom_dir: None,
+            format: OutputFormat::SameAsOriginal,
+            naming: NamingMode::KeepOriginal,
+            custom_suffix: None,
+        };
+
+        let output = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+
+        assert_eq!(output, "C:\\comics\\vol1\\001.jpg", "KeepOriginal should keep original filename without suffix");
+    }
+
+    #[test]
+    fn test_compute_output_path_custom_dir_date_suffix() {
+        let settings = OutputSettings {
+            operation: OutputOperation::CustomDir,
+            custom_dir: Some("C:\\output".to_string()),
+            format: OutputFormat::WebP,
+            naming: NamingMode::DateSuffix,
+            custom_suffix: None,
+        };
+
+        let output = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+
+        assert!(output.starts_with("C:\\output"));
+        assert!(output.contains("vol1"));
+        assert!(output.ends_with(".webp"));
+        assert!(output.contains("001_20260425") || output.contains("001_2026"));
+    }
+
+    #[test]
+    fn test_compute_output_path_overwrite_no_suffix() {
+        let settings = OutputSettings {
+            operation: OutputOperation::Overwrite,
+            custom_dir: None,
+            format: OutputFormat::SameAsOriginal,
+            naming: NamingMode::KeepOriginal,
+            custom_suffix: None,
+        };
+
+        let output = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+
+        assert_eq!(output, "C:\\comics\\vol1\\001.jpg");
+    }
+
+    #[test]
+    fn test_compute_output_path_empty_custom_suffix_keeps_original() {
+        let settings = OutputSettings {
+            operation: OutputOperation::SameDir,
+            custom_dir: None,
+            format: OutputFormat::SameAsOriginal,
+            naming: NamingMode::CustomSuffix,
+            custom_suffix: Some("".to_string()),
+        };
+
+        let output = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+
+        assert_eq!(output, "C:\\comics\\vol1\\001.jpg", "Empty custom suffix should keep original filename");
     }
 
     #[test]
@@ -482,6 +804,8 @@ mod tests {
             operation: OutputOperation::CustomDir,
             custom_dir: Some("C:\\output".to_string()),
             format: OutputFormat::WebP,
+            naming: NamingMode::KeepOriginal,
+            custom_suffix: None,
         };
 
         let output = ImageProcessor::compute_output_path(
@@ -516,6 +840,8 @@ mod tests {
                 operation: OutputOperation::SameDir,
                 custom_dir: None,
                 format: OutputFormat::Jpeg,
+                naming: NamingMode::KeepOriginal,
+                custom_suffix: None,
             },
             quality: QualitySettings {
                 mode: QualityMode::Quality,
@@ -549,6 +875,8 @@ mod tests {
                 operation: OutputOperation::SameDir,
                 custom_dir: None,
                 format: OutputFormat::Jpeg,
+                naming: NamingMode::KeepOriginal,
+                custom_suffix: None,
             },
             quality: QualitySettings {
                 mode: QualityMode::Quality,

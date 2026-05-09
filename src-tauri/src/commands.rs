@@ -73,20 +73,18 @@ pub async fn start_processing(
         Arc::clone(&state.is_processing)
     };
 
-    let app_handle = app.clone();
-    let app_handle_progress = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let result = ImageProcessor::batch_process(
             &files,
             &profile,
             &source_dir,
             &stop_flag,
-            move |event| {
-                let _ = app_handle_progress.emit("progress_update", &event);
+            |event| {
+                let _ = app.emit("progress_update", &event);
             },
         );
 
-        let _ = app_handle.emit("processing_complete", &result);
+        let _ = app.emit("processing_complete", &result);
         is_processing.store(false, Ordering::Relaxed);
     });
 

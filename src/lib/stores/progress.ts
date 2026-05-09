@@ -7,6 +7,8 @@ function createProgressStore() {
   const isProcessing = writable<boolean>(false);
   const current = writable<number>(0);
   const total = writable<number>(0);
+  const totalOriginalBytes = writable<number>(0);
+  const processedBytes = writable<number>(0);
   const results = writable<Array<{file: string; original_size: number; new_size: number; status: string}>>([]);
   const batchResult = writable<BatchResult | null>(null);
 
@@ -16,40 +18,18 @@ function createProgressStore() {
       $total > 0 ? Math.round(($current / $total) * 100) : 0
   );
 
+  const bytePercentage = derived(
+    [processedBytes, totalOriginalBytes],
+    ([$processed, $totalBytes]) =>
+      $totalBytes > 0 ? Math.round(($processed / $totalBytes) * 100) : 0
+  );
+
   const totalSaved = derived(batchResult, ($result) =>
     $result ? $result.total_saved_bytes : 0
   );
 
-  let unlisteners: Array<() => void> = [];
-
-  async function startListening() {
-    const unlisten1 = await listen<ProgressEvent>("progress_update", (event) => {
-      const payload = event.payload;
-      current.set(payload.current);
-      total.set(payload.total);
-      results.update((r) => [
-        ...r,
-        {
-          file: payload.file,
-          original_size: payload.original_size,
-          new_size: payload.new_size,
-          status: payload.status,
-        },
-      ]);
-    });
-
-    const unlisten2 = await listen<BatchResult>("processing_complete", (event) => {
-      batchResult.set(event.payload);
-      isProcessing.set(false);
-    });
-
-    unlisteners = [unlisten1, unlisten2];
-  }
-
-  function stopListening() {
-    unlisteners.forEach((fn) => fn());
-    unlisteners = [];
-  }
+  let unlistenProgress: (() => void) | null = null;
+  let unlistenComplete: (() => void) | null = null;
 
   async function startProcessing(
     files: FileMetadata[],
@@ -62,7 +42,27 @@ function createProgressStore() {
     batchResult.set(null);
     isProcessing.set(true);
 
-    await startListening();
+    unlistenProgress = await listen<ProgressEvent>("progress_update", (e) => {
+      current.set(e.payload.current);
+      total.set(e.payload.total);
+      totalOriginalBytes.set(e.payload.total_original_bytes);
+      processedBytes.set(e.payload.processed_bytes);
+      results.update((r) => [
+        ...r,
+        {
+          file: e.payload.file,
+          original_size: e.payload.original_size,
+          new_size: e.payload.new_size,
+          status: e.payload.status,
+        },
+      ]);
+    });
+
+    unlistenComplete = await listen<BatchResult>("processing_complete", (e) => {
+      batchResult.set(e.payload);
+      isProcessing.set(false);
+    });
+
     try {
       await invoke("start_processing", {
         files,
@@ -87,18 +87,30 @@ function createProgressStore() {
     isProcessing.set(false);
     current.set(0);
     total.set(0);
+    totalOriginalBytes.set(0);
+    processedBytes.set(0);
     results.set([]);
     batchResult.set(null);
-    stopListening();
+    if (unlistenProgress) {
+      unlistenProgress();
+      unlistenProgress = null;
+    }
+    if (unlistenComplete) {
+      unlistenComplete();
+      unlistenComplete = null;
+    }
   }
 
   return {
     isProcessing,
     current,
     total,
+    totalOriginalBytes,
+    processedBytes,
     results,
     batchResult,
     percentage,
+    bytePercentage,
     totalSaved,
     startProcessing,
     stopProcessing,
