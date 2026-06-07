@@ -36,9 +36,21 @@ function createProgressStore() {
     profile: Profile,
     sourceDir: string
   ) {
+    // 先取消上一次的事件监听器，防止重复注册
+    if (unlistenProgress) {
+      unlistenProgress();
+      unlistenProgress = null;
+    }
+    if (unlistenComplete) {
+      unlistenComplete();
+      unlistenComplete = null;
+    }
+
     results.set([]);
     current.set(0);
     total.set(files.length);
+    totalOriginalBytes.set(0);
+    processedBytes.set(0);
     batchResult.set(null);
     isProcessing.set(true);
 

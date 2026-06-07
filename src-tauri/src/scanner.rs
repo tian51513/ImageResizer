@@ -35,16 +35,22 @@ pub fn scan_directory(dir: &str) -> Result<Vec<FileMetadata>, String> {
 
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
 
+        let (width, height) = image::image_dimensions(entry.path())
+            .unwrap_or((0, 0));
+
         files.push(FileMetadata {
             path: entry.path().to_string_lossy().to_string(),
             size_bytes: size,
             extension: ext,
+            width,
+            height,
         });
     }
 
     Ok(files)
 }
 
+#[cfg(test)]
 pub fn filter_by_extension(files: &[FileMetadata], extensions: &[&str]) -> Vec<FileMetadata> {
     files
         .iter()
@@ -57,6 +63,7 @@ pub fn filter_by_extension(files: &[FileMetadata], extensions: &[&str]) -> Vec<F
         .collect()
 }
 
+#[cfg(test)]
 pub fn total_size(files: &[FileMetadata]) -> u64 {
     files.iter().map(|f| f.size_bytes).sum()
 }
@@ -112,22 +119,73 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_reads_image_dimensions() {
+        use image::{ImageBuffer, Rgb};
+
+        let dir = std::env::temp_dir().join("imageresizer_scanner_test_dimensions");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+
+        // Create real images with known dimensions
+        let img_100x50 = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(100, 50, Rgb([255, 0, 0]));
+        img_100x50.save(dir.join("photo.jpg")).unwrap();
+        let img_200x300 = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(200, 300, Rgb([0, 255, 0]));
+        img_200x300.save(dir.join("image.png")).unwrap();
+
+        let files = scan_directory(&dir.to_string_lossy()).unwrap();
+        cleanup_test_dir(&dir.to_string_lossy());
+
+        assert_eq!(files.len(), 2);
+
+        let jpg = files.iter().find(|f| f.extension == "jpg").unwrap();
+        assert_eq!(jpg.width, 100);
+        assert_eq!(jpg.height, 50);
+
+        let png = files.iter().find(|f| f.extension == "png").unwrap();
+        assert_eq!(png.width, 200);
+        assert_eq!(png.height, 300);
+    }
+
+    #[test]
+    fn test_scan_returns_zero_dimensions_for_corrupt_file() {
+        let dir = std::env::temp_dir().join("imageresizer_scanner_test_corrupt");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+
+        // Write a valid extension but corrupt content
+        fs::write(dir.join("corrupt.jpg"), "not_a_real_jpeg").unwrap();
+
+        let files = scan_directory(&dir.to_string_lossy()).unwrap();
+        cleanup_test_dir(&dir.to_string_lossy());
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].width, 0);
+        assert_eq!(files[0].height, 0);
+    }
+
+    #[test]
     fn test_filter_by_extension() {
         let files = vec![
             FileMetadata {
                 path: "a.jpg".to_string(),
                 size_bytes: 100,
                 extension: "jpg".to_string(),
+                width: 0,
+                height: 0,
             },
             FileMetadata {
                 path: "b.png".to_string(),
                 size_bytes: 200,
                 extension: "png".to_string(),
+                width: 0,
+                height: 0,
             },
             FileMetadata {
                 path: "c.gif".to_string(),
                 size_bytes: 300,
                 extension: "gif".to_string(),
+                width: 0,
+                height: 0,
             },
         ];
 
@@ -145,11 +203,15 @@ mod tests {
                 path: "a.jpg".to_string(),
                 size_bytes: 1024,
                 extension: "jpg".to_string(),
+                width: 0,
+                height: 0,
             },
             FileMetadata {
                 path: "b.png".to_string(),
                 size_bytes: 2048,
                 extension: "png".to_string(),
+                width: 0,
+                height: 0,
             },
         ];
 

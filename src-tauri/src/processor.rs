@@ -1,6 +1,6 @@
 use crate::config::*;
 use image::imageops::FilterType;
-use image::io::Reader as ImageReader;
+use image::ImageReader;
 use image::{DynamicImage, GenericImageView, ImageFormat};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,52 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct ImageProcessor;
+
+impl ImageProcessor {
+    /// Estimate memory usage (bytes) for processing a single image.
+    /// Accounts for decoded pixels + resized copy + encode buffer overhead.
+    pub fn estimate_memory_bytes(width: u32, height: u32, target_width: u32, target_height: u32) -> u64 {
+        // Assume RGBA8 (4 bytes per pixel) for worst case
+        let decode_bytes = (width as u64) * (height as u64) * 4;
+        let resize_bytes = (target_width as u64) * (target_height as u64) * 4;
+        // Encode buffer overhead: ~20% of the larger buffer
+        let encode_overhead = ((decode_bytes.max(resize_bytes)) as f64 * 0.2) as u64;
+        decode_bytes + resize_bytes + encode_overhead
+    }
+
+    /// Compute target dimensions based on resize settings and original dimensions.
+    pub fn compute_target_dimensions(orig_w: u32, orig_h: u32, settings: &ResizeSettings) -> (u32, u32) {
+        if orig_w == 0 || orig_h == 0 {
+            return (0, 0);
+        }
+        let (target_w, target_h) = match settings.unit {
+            SizeUnit::Percentage => {
+                (orig_w * settings.width as u32 / 100, orig_h * settings.height as u32 / 100)
+            }
+            SizeUnit::Pixel => (settings.width, settings.height),
+        };
+        (target_w.max(1), target_h.max(1))
+    }
+
+    /// Partition files into (parallel_group, serial_group) based on memory budget.
+    pub fn partition_by_memory(files: &[FileMetadata], profile: &Profile) -> (Vec<FileMetadata>, Vec<FileMetadata>) {
+        let budget_bytes = (profile.memory_budget_mb as u64) * 1024 * 1024;
+        let mut parallel = Vec::new();
+        let mut serial = Vec::new();
+
+        for file in files {
+            let (tw, th) = Self::compute_target_dimensions(file.width, file.height, &profile.resize);
+            let estimated = Self::estimate_memory_bytes(file.width, file.height, tw, th);
+            if estimated > budget_bytes {
+                serial.push(file.clone());
+            } else {
+                parallel.push(file.clone());
+            }
+        }
+
+        (parallel, serial)
+    }
+}
 
 impl ImageProcessor {
     /// Process a single image file: decode -> resize -> encode -> save
@@ -449,7 +495,7 @@ impl ImageProcessor {
         }
     }
 
-    /// Batch process multiple files in parallel
+    /// Batch process multiple files: parallel group via rayon, serial group sequentially.
     pub fn batch_process(
         files: &[FileMetadata],
         profile: &Profile,
@@ -457,16 +503,19 @@ impl ImageProcessor {
         stop_flag: &Arc<AtomicBool>,
         progress_callback: impl Fn(ProgressEvent) + Send + Sync,
     ) -> BatchResult {
+        let (parallel_files, serial_files) = Self::partition_by_memory(files, profile);
         let total = files.len() as u32;
         let total_original_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
         let processed_bytes = Arc::new(AtomicU64::new(0));
+        let processed_count = Arc::new(AtomicU64::new(0));
 
-        let results: Vec<ProcessResult> = files
+        // Process parallel group with rayon
+        let parallel_results: Vec<ProcessResult> = parallel_files
             .par_iter()
-            .enumerate()
-            .filter_map(|(i, file)| {
+            .filter_map(|file| {
                 if stop_flag.load(Ordering::Relaxed) {
                     processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed);
+                    processed_count.fetch_add(1, Ordering::Relaxed);
                     return Some(ProcessResult {
                         file: file.path.clone(),
                         original_size: file.size_bytes,
@@ -492,10 +541,11 @@ impl ImageProcessor {
                 };
 
                 let bytes = processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed) + file.size_bytes;
+                let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                 progress_callback(ProgressEvent {
                     total,
-                    current: (i + 1) as u32,
+                    current: current as u32,
                     file: file.path.clone(),
                     original_size: result.original_size,
                     new_size: result.new_size,
@@ -507,6 +557,57 @@ impl ImageProcessor {
                 Some(result)
             })
             .collect();
+
+        // Process serial group one at a time
+        let mut serial_results = Vec::new();
+        for file in &serial_files {
+            if stop_flag.load(Ordering::Relaxed) {
+                processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed);
+                processed_count.fetch_add(1, Ordering::Relaxed);
+                serial_results.push(ProcessResult {
+                    file: file.path.clone(),
+                    original_size: file.size_bytes,
+                    new_size: 0,
+                    status: "skipped".to_string(),
+                });
+                continue;
+            }
+
+            let output_path =
+                Self::compute_output_path(&file.path, source_dir, &profile.output);
+
+            let result = match Self::process_file(&file.path, &output_path, profile) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("FAILED [{}]: {}", file.path, e);
+                    ProcessResult {
+                        file: file.path.clone(),
+                        original_size: file.size_bytes,
+                        new_size: 0,
+                        status: format!("failed: {}", e),
+                    }
+                }
+            };
+
+            let bytes = processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed) + file.size_bytes;
+            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+            progress_callback(ProgressEvent {
+                total,
+                current: current as u32,
+                file: file.path.clone(),
+                original_size: result.original_size,
+                new_size: result.new_size,
+                status: result.status.clone(),
+                total_original_bytes,
+                processed_bytes: bytes,
+            });
+
+            serial_results.push(result);
+        }
+
+        let mut results = parallel_results;
+        results.extend(serial_results);
 
         let success = results
             .iter()
@@ -548,6 +649,86 @@ mod tests {
     use super::*;
     use image::{ImageBuffer, Rgb};
     use std::fs;
+
+    #[test]
+    fn test_estimate_memory_for_10000x10000() {
+        // 10000x10000 RGBA8 decode = 400MB, resize to same = 400MB, overhead ~80MB
+        let bytes = ImageProcessor::estimate_memory_bytes(10000, 10000, 10000, 10000);
+        // (10000*10000*4) + (10000*10000*4) + 20% of max = 400M + 400M + 80M = 880M
+        assert_eq!(bytes, 880_000_000);
+    }
+
+    #[test]
+    fn test_estimate_memory_shrinking_reduces_total() {
+        let full = ImageProcessor::estimate_memory_bytes(10000, 10000, 10000, 10000);
+        let shrunk = ImageProcessor::estimate_memory_bytes(10000, 10000, 2000, 2000);
+        assert!(shrunk < full);
+    }
+
+    #[test]
+    fn test_estimate_memory_zero_dimensions() {
+        let bytes = ImageProcessor::estimate_memory_bytes(0, 0, 0, 0);
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn test_partition_small_files_all_parallel() {
+        let files = vec![
+            FileMetadata { path: "a.jpg".into(), size_bytes: 1000, extension: "jpg".into(), width: 500, height: 500 },
+            FileMetadata { path: "b.png".into(), size_bytes: 2000, extension: "png".into(), width: 800, height: 600 },
+        ];
+        let profile = Profile {
+            name: "test".into(),
+            resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
+            output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
+            quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
+            memory_budget_mb: 1024,
+        };
+
+        let (parallel, serial) = ImageProcessor::partition_by_memory(&files, &profile);
+        assert_eq!(parallel.len(), 2);
+        assert_eq!(serial.len(), 0);
+    }
+
+    #[test]
+    fn test_partition_large_file_goes_to_serial() {
+        let files = vec![
+            FileMetadata { path: "small.jpg".into(), size_bytes: 1000, extension: "jpg".into(), width: 100, height: 100 },
+            FileMetadata { path: "huge.jpg".into(), size_bytes: 5000, extension: "jpg".into(), width: 10000, height: 10000 },
+        ];
+        let profile = Profile {
+            name: "test".into(),
+            resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
+            output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
+            quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
+            memory_budget_mb: 1, // 1MB
+        };
+
+        let (parallel, serial) = ImageProcessor::partition_by_memory(&files, &profile);
+        assert_eq!(parallel.len(), 1);
+        assert_eq!(parallel[0].path, "small.jpg");
+        assert_eq!(serial.len(), 1);
+        assert_eq!(serial[0].path, "huge.jpg");
+    }
+
+    #[test]
+    fn test_partition_all_files_over_budget() {
+        let files = vec![
+            FileMetadata { path: "a.jpg".into(), size_bytes: 1000, extension: "jpg".into(), width: 10000, height: 10000 },
+            FileMetadata { path: "b.jpg".into(), size_bytes: 2000, extension: "jpg".into(), width: 20000, height: 20000 },
+        ];
+        let profile = Profile {
+            name: "test".into(),
+            resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
+            output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
+            quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
+            memory_budget_mb: 1, // 1MB — way too small
+        };
+
+        let (parallel, serial) = ImageProcessor::partition_by_memory(&files, &profile);
+        assert_eq!(parallel.len(), 0);
+        assert_eq!(serial.len(), 2);
+    }
 
     fn create_test_image(path: &str, width: u32, height: u32) {
         let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(width, height, Rgb([255u8, 0, 0]));
@@ -850,6 +1031,7 @@ mod tests {
                 adjust_dpi: false,
                 dpi: 96,
             },
+            memory_budget_mb: 1024,
         };
 
         let result = ImageProcessor::process_file(&input, &output, &profile).unwrap();
@@ -885,6 +1067,7 @@ mod tests {
                 adjust_dpi: false,
                 dpi: 96,
             },
+            memory_budget_mb: 1024,
         };
 
         let result = ImageProcessor::process_file("/nonexistent/file.jpg", "/tmp/out.jpg", &profile);

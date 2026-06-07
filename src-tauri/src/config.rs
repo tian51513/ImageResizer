@@ -83,6 +83,7 @@ pub struct Profile {
     pub resize: ResizeSettings,
     pub output: OutputSettings,
     pub quality: QualitySettings,
+    pub memory_budget_mb: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +91,8 @@ pub struct FileMetadata {
     pub path: String,
     pub size_bytes: u64,
     pub extension: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +186,7 @@ impl ConfigManager {
                     adjust_dpi: false,
                     dpi: 96,
                 },
+                memory_budget_mb: 1024,
             },
             Profile {
                 name: "高质量".to_string(),
@@ -207,6 +211,7 @@ impl ConfigManager {
                     adjust_dpi: false,
                     dpi: 96,
                 },
+                memory_budget_mb: 1024,
             },
             Profile {
                 name: "极限压缩".to_string(),
@@ -231,6 +236,7 @@ impl ConfigManager {
                     adjust_dpi: false,
                     dpi: 96,
                 },
+                memory_budget_mb: 1024,
             },
         ]
     }
@@ -298,6 +304,7 @@ mod tests {
                 adjust_dpi: true,
                 dpi: 72,
             },
+            memory_budget_mb: 1024,
         };
 
         let json = serde_json::to_string(&profile).unwrap();

@@ -3,6 +3,7 @@ export interface Profile {
   resize: ResizeSettings;
   output: OutputSettings;
   quality: QualitySettings;
+  memory_budget_mb: number;
 }
 
 export interface ResizeSettings {
@@ -42,6 +43,8 @@ export interface FileMetadata {
   path: string;
   size_bytes: number;
   extension: string;
+  width: number;
+  height: number;
 }
 
 export interface ProgressEvent {
