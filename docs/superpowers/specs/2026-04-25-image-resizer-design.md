@@ -2,6 +2,7 @@
 
 > 日期: 2026-04-25
 > 状态: 已批准
+> 更新: 2026-09-19 — 编码层升级（jpeg-encoder/libwebp/oxipng + 三档压缩）、内存门控并发、原子写出、DPI 实现（见第 4/5/7 节）
 
 ## 1. 项目概述
 
@@ -13,8 +14,8 @@
 |------|------|
 | GUI 框架 | Tauri (Rust 后端 + 系统 WebView) |
 | 前端 | Svelte + TypeScript |
-| 图片引擎 | Rust `image` crate |
-| 并发处理 | `rayon` (自动检测 CPU 核心数) |
+| 图片引擎 | 解码/缩放: Rust `image` crate；编码: `jpeg-encoder` + `libwebp-sys` + `oxipng` |
+| 并发处理 | `rayon` + `MemoryGate` 加权内存门控（按 `memory_budget_mb` 限制并发） |
 | 目录遍历 | `walkdir` crate |
 | 配置存储 | JSON 文件 (`%APPDATA%/ImageResizer/profiles.json`) |
 
@@ -132,16 +133,23 @@ Rust 后端 (Tauri Core)
 
 | Crate | 用途 |
 |-------|------|
-| `image` | 图片解码/编码/缩放核心 |
+| `image` | 图片解码/缩放（编码已由专用库接管，仅 GIF 仍走 image 编码） |
+| `jpeg-encoder` | JPEG 编码：progressive 扫描 + 优化 Huffman 表 + DPI (JFIF) 元数据 |
+| `libwebp-sys` | WebP 编码：Google libwebp 参考实现（有损 quality / 无损） |
+| `oxipng` | PNG 无损优化（纯 Rust、单线程构建，避免与 rayon 线程超订） |
 | `rayon` | CPU 并行处理 |
 | `walkdir` | 高效递归目录遍历 |
 | `serde` / `serde_json` | 配置序列化 |
 | `glob` | 文件格式匹配 |
 
+> 注：jpeg-encoder 0.7.1 的 baseline + 优化 Huffman 组合会输出损坏文件，
+> 档位映射刻意只用「基线无优化」和「progressive+优化」两种安全组合，
+> `test_jpeg_balanced_roundtrip_not_corrupt` 为防回归闸门。
+
 ### 处理流水线
 
 ```
-读取文件 → 解码 → resize (按模式) → 编码 (目标格式+品质) → 写入输出
+读取文件 → 解码 → resize (按模式，随即释放解码缓冲) → 编码 (目标格式+品质+档位) → 原子写出
 ```
 
 ### 缩放模式
@@ -160,25 +168,37 @@ Rust 后端 (Tauri Core)
 
 ### 品质控制
 
-| 格式 | 品质参数 | 说明 |
-|------|---------|------|
-| JPEG | quality 1-100 | 标准 JPEG 品质参数 |
-| PNG | 压缩级别 0-9 | V1 仅支持无损压缩 |
-| WebP | quality 1-100 | 支持 lossy 和 lossless |
-| GIF | 调色板颜色数 | 控制颜色数量来控制大小 |
+| 格式 | 编码器 | 品质参数 |
+|------|--------|---------|
+| JPEG | `jpeg-encoder`（progressive + 优化 Huffman，按档位启用） | quality 1-100；q<90 自动 4:2:0 色度抽样；可写 DPI (JFIF) |
+| PNG | `image` 编码后经 `oxipng` 无损优化 | 无损（像素级一致）；品质值映射为优化级别 |
+| WebP | `libwebp` 有损编码 | quality 1-100（"保持原品质"档为无损，像素级还原） |
+| GIF | `image` crate（单帧） | 无品质参数 |
 
 品质控制模式:
 - **品质模式**: 用户指定品质百分比 (1-100)
-- **目标大小模式**: 用户指定目标文件大小 (KB)，引擎自动计算合适的品质
-- **保持原始品质**: 不调整品质，仅做尺寸/格式/DPI 变更
+- **目标大小模式**: 用户指定目标文件大小 (KB)，JPEG/WebP 二分搜索最大可用品质；PNG/GIF 暂不支持（按默认品质输出）
+- **保持原始品质**: WebP 无损 / JPEG q95 / PNG oxipng 无损优化，仅做尺寸/格式/DPI 变更
+
+### 压缩档位 (CompressionTier)
+
+配置级固定档位，打包各格式的编码器取舍（存于 `Profile.compression`，旧配置文件缺字段时按"均衡"加载）：
+
+| 档位 | JPEG | PNG (oxipng preset) | WebP | 定位 |
+|------|------|--------------------|------|------|
+| 极速 Speed | 基线编码（无优化表） | 1 | 有损 | 最快，实测比旧编码器快 ~2 倍且更小 |
+| 均衡 Balanced（默认） | progressive + 优化 Huffman | 2 | 有损 | 体积/速度兼得 |
+| 极限 Extreme | 同均衡 | 4 | 有损 | PNG 进一步压小 |
 
 ### 并发模型
 
 ```
-rayon::par_iter() 自动按 CPU 核心数分片
-每片独立处理一个文件
-通过 channel 将进度事件发送到前端
-支持中途停止 (通过 AtomicBool 标志位)
+rayon::par_iter() 按文件并行
+MemoryGate 加权信号量：处理前按估算内存（解码+缩放+编码缓冲）授予额度，
+在飞总量不超过 memory_budget_mb；超预算排队，单张超预算大图降级为独占运行
+解码缓冲在缩放完成后立即释放（大缩小场景峰值内存约减半）
+所有输出经临时文件 + 原子 rename 写出，中途失败不会损坏已有文件
+支持中途停止 (AtomicBool 标志位，文件边界生效)
 ```
 
 ### 错误处理
@@ -200,6 +220,8 @@ struct Profile {
     resize: ResizeSettings,
     output: OutputSettings,
     quality: QualitySettings,
+    compression: CompressionTier, // Speed | Balanced | Extreme（serde default，旧配置兼容）
+    memory_budget_mb: u32,        // MemoryGate 并发内存预算
 }
 
 struct ResizeSettings {
@@ -214,13 +236,15 @@ struct OutputSettings {
     operation: Operation,   // Overwrite | SameDir | CustomDir
     custom_dir: Option<String>,
     format: OutputFormat,   // SameAsOriginal | Jpeg | Png | WebP | Gif
+    naming: NamingMode,     // KeepOriginal | CustomSuffix | DateSuffix
+    custom_suffix: Option<String>,
 }
 
 struct QualitySettings {
     mode: QualityMode,      // Quality | TargetSize | Original
     quality: u8,            // 1-100
     target_size_kb: Option<u32>,
-    adjust_dpi: bool,
+    adjust_dpi: bool,       // JPEG 写入 JFIF DPI 元数据
     dpi: u32,
 }
 ```
@@ -231,9 +255,12 @@ struct QualitySettings {
 
 ### 内置默认方案
 
-1. **常用**: 宽高 100%，品质 40%，与原文件同格式，同目录输出
-2. **高质量**: 宽高 100%，品质 85%，与原文件同格式，自定义目录
-3. **极限压缩**: 宽高 50%，品质 20%，输出为 WebP，同目录输出
+1. **常用**: 宽高 100%，品质 40%，保持原格式，同目录 + 日期后缀，均衡档
+2. **高质量**: 宽高 100%，品质 85%，保持原格式，自定义目录 + 原名，均衡档
+3. **极限压缩**: 宽高 50%，品质 20%，输出 WebP，同目录 + 日期后缀，极限档
+
+> 建议把"极限压缩"等会改格式的方案设为**自定义目录**输出，产物进独立目录树
+> （保持源目录相对结构），避免误操作混入原图。
 
 ### 方案操作
 
@@ -266,11 +293,12 @@ struct QualitySettings {
 
 | 模式 | 说明 |
 |------|------|
-| 覆盖原文件 | 直接替换原始文件 (不可逆) |
-| 同目录输出 | 在原文件同目录下生成新文件，带后缀 (如 `_compressed`) |
-| 自定义目录 | 输出到用户指定的目录，保持相对目录结构 |
+| 覆盖原文件 | 同格式时原子替换原文件；**格式变更时不覆盖**，在原文件旁以新扩展名输出 |
+| 同目录输出 | 在原文件同目录下生成新文件，按命名模式加后缀（原名/日期/自定义） |
+| 自定义目录 | 输出到用户指定的目录，完整保持多级相对目录结构 |
 
-输出目录结构保持与源目录一致 (相对路径映射)。
+输出目录结构保持与源目录一致 (相对路径映射)。所有写出均为
+"临时文件 + 原子 rename"，中途断电/出错不会留下半截文件。
 
 ---
 
