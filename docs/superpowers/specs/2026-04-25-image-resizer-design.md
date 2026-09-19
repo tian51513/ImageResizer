@@ -3,6 +3,7 @@
 > 日期: 2026-04-25
 > 状态: 已批准
 > 更新: 2026-09-19 — 编码层升级（jpeg-encoder/libwebp/oxipng + 三档压缩）、内存门控并发、原子写出、DPI 实现（见第 4/5/7 节）
+> 更新: 2026-09-19（二）— 批处理可靠性：panic 守卫、进度事件批量化、Stop 单文件内可中断、后台友好调度（见第 2/4 节）
 
 ## 1. 项目概述
 
@@ -64,8 +65,8 @@ Rust 后端 (Tauri Core)
     ├── Command: delete_profile(name)         → 删除方案
     ├── Command: start_processing(config)      → 触发处理
     │
-    ├── Event: progress_update(payload)        ← 实时进度
-    │   { total, current, file, original_size, new_size, status }
+    ├── Event: progress_update(payload)        ← 实时进度（50ms 时间切片批量）
+    │   { last: { total, current, ..., processed_bytes }, results: [ {file, original_size, new_size, status}, ... ] }
     │
     └── Event: processing_complete(result)     ← 完成通知
         { total_files, success, failed, failed_files, total_saved_bytes }
@@ -193,19 +194,29 @@ Rust 后端 (Tauri Core)
 ### 并发模型
 
 ```
-rayon::par_iter() 按文件并行
+专用 rayon 线程池：核数-1 个工作线程，线程优先级"低于正常"
+（机器空闲时满速，前台应用需要 CPU 时立即让路）
 MemoryGate 加权信号量：处理前按估算内存（解码+缩放+编码缓冲）授予额度，
 在飞总量不超过 memory_budget_mb；超预算排队，单张超预算大图降级为独占运行
 解码缓冲在缩放完成后立即释放（大缩小场景峰值内存约减半）
 所有输出经临时文件 + 原子 rename 写出，中途失败不会损坏已有文件
-支持中途停止 (AtomicBool 标志位，文件边界生效)
 ```
+
+**批处理生命周期保证**：
+- `ProcessingGuard`（RAII）持有 is_processing 标志，正常/出错/panic 一律复位
+- 批处理整体由 `catch_unwind` 包裹：崩溃也发出带失败报告的 `processing_complete`
+- Stop 请求穿透到单文件内部（目标大小二分搜索每步检查），立即以当前最优收尾
+
+**进度通道**：`ProgressBatcher` 把每文件事件聚合成 50ms 一批再走 IPC
+（万级文件从 ~N 次跨进程事件降为数百次）；前端原地追加结果行，避免 O(n²) 重建。
 
 ### 错误处理
 
 - 单个文件处理失败不中断整体批处理
 - 失败文件记录到失败列表
 - 处理完成后汇总报告 (成功数、失败数、失败文件列表)
+- 批处理线程 panic 不卡死 UI（守卫复位 + 终局失败事件）
+- 前端错误可见面：进度面板错误横幅；方案保存/删除失败弹窗提示
 - 支持仅重试失败文件
 
 ---
