@@ -1,6 +1,6 @@
 <script lang="ts">
   import { profilesStore } from "../stores/profiles";
-  import type { QualityMode } from "../types";
+  import type { CompressionTier, QualityMode } from "../types";
 
   const { activeProfile } = profilesStore;
 </script>
@@ -56,6 +56,23 @@
         />
         保持原始品质
       </label>
+    </div>
+
+    <div class="field-row">
+      <label>压缩档位:</label>
+      {#each [["Speed", "极速"], ["Balanced", "均衡"], ["Extreme", "极限"]] as [tier, label]}
+        <label>
+          <input
+            type="radio"
+            name="compression-tier"
+            checked={$activeProfile.compression === tier}
+            onchange={() => {
+              profilesStore.updateActiveProfile({ compression: tier as CompressionTier });
+            }}
+          />
+          {label}
+        </label>
+      {/each}
     </div>
 
     {#if $activeProfile.quality.mode === "Quality"}

@@ -48,6 +48,37 @@ pub enum QualityMode {
     Original,
 }
 
+/// Fixed compression tiers bundling per-format encoder settings.
+/// Speed = fastest encode, Extreme = smallest output.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+pub enum CompressionTier {
+    Speed,
+    #[default]
+    Balanced,
+    Extreme,
+}
+
+impl CompressionTier {
+    /// JPEG: use progressive scans (slightly slower, smaller output)
+    pub fn jpeg_progressive(self) -> bool {
+        !matches!(self, CompressionTier::Speed)
+    }
+
+    /// JPEG: build optimized Huffman tables (smaller output)
+    pub fn jpeg_optimized_huffman(self) -> bool {
+        !matches!(self, CompressionTier::Speed)
+    }
+
+    /// PNG: oxipng optimization preset level (0-6, higher = smaller but slower)
+    pub fn oxipng_preset(self) -> u8 {
+        match self {
+            CompressionTier::Speed => 1,
+            CompressionTier::Balanced => 2,
+            CompressionTier::Extreme => 4,
+        }
+    }
+}
+
 // ── Structs ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -83,6 +114,10 @@ pub struct Profile {
     pub resize: ResizeSettings,
     pub output: OutputSettings,
     pub quality: QualitySettings,
+    /// Encoder tier; `#[serde(default)]` keeps profiles.json from older
+    /// versions of the app loadable (they decode as Balanced).
+    #[serde(default)]
+    pub compression: CompressionTier,
     pub memory_budget_mb: u32,
 }
 
@@ -186,6 +221,7 @@ impl ConfigManager {
                     adjust_dpi: false,
                     dpi: 96,
                 },
+                compression: CompressionTier::Balanced,
                 memory_budget_mb: 1024,
             },
             Profile {
@@ -211,6 +247,7 @@ impl ConfigManager {
                     adjust_dpi: false,
                     dpi: 96,
                 },
+                compression: CompressionTier::Balanced,
                 memory_budget_mb: 1024,
             },
             Profile {
@@ -236,6 +273,7 @@ impl ConfigManager {
                     adjust_dpi: false,
                     dpi: 96,
                 },
+                compression: CompressionTier::Extreme,
                 memory_budget_mb: 1024,
             },
         ]
@@ -245,6 +283,43 @@ impl ConfigManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compression_tier_defaults() {
+        let profiles = ConfigManager::default_profiles();
+        assert_eq!(profiles[0].compression, CompressionTier::Balanced);
+        assert_eq!(profiles[1].compression, CompressionTier::Balanced);
+        assert_eq!(profiles[2].compression, CompressionTier::Extreme);
+    }
+
+    #[test]
+    fn test_profile_deserialize_legacy_json_without_compression() {
+        let json = r#"{
+            "name": "t",
+            "resize": {"width": 1, "height": 1, "unit": "Percentage", "mode": "Fit", "keep_aspect_ratio": true},
+            "output": {"operation": "SameDir", "custom_dir": null, "format": "Jpeg", "naming": "KeepOriginal", "custom_suffix": null},
+            "quality": {"mode": "Quality", "quality": 80, "target_size_kb": null, "adjust_dpi": false, "dpi": 96},
+            "memory_budget_mb": 1024
+        }"#;
+        let p: Profile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.compression, CompressionTier::Balanced);
+    }
+
+    #[test]
+    fn test_tier_encoder_mappings() {
+        // Speed: fastest, least optimization
+        assert!(!CompressionTier::Speed.jpeg_progressive());
+        assert!(!CompressionTier::Speed.jpeg_optimized_huffman());
+        assert_eq!(CompressionTier::Speed.oxipng_preset(), 1);
+        // Balanced: default
+        assert!(CompressionTier::Balanced.jpeg_progressive());
+        assert!(CompressionTier::Balanced.jpeg_optimized_huffman());
+        assert_eq!(CompressionTier::Balanced.oxipng_preset(), 2);
+        // Extreme: max compression
+        assert!(CompressionTier::Extreme.jpeg_progressive());
+        assert!(CompressionTier::Extreme.jpeg_optimized_huffman());
+        assert_eq!(CompressionTier::Extreme.oxipng_preset(), 4);
+    }
 
     #[test]
     fn test_default_profiles() {
@@ -304,6 +379,7 @@ mod tests {
                 adjust_dpi: true,
                 dpi: 72,
             },
+            compression: CompressionTier::Balanced,
             memory_budget_mb: 1024,
         };
 

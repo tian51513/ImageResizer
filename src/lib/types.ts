@@ -3,6 +3,7 @@ export interface Profile {
   resize: ResizeSettings;
   output: OutputSettings;
   quality: QualitySettings;
+  compression: CompressionTier;
   memory_budget_mb: number;
 }
 
@@ -38,6 +39,9 @@ export interface QualitySettings {
 }
 
 export type QualityMode = "Quality" | "TargetSize" | "Original";
+
+/** 编码档位：极速=最快编码，均衡=默认，极限=最小体积（较慢） */
+export type CompressionTier = "Speed" | "Balanced" | "Extreme";
 
 export interface FileMetadata {
   path: string;

@@ -118,7 +118,7 @@ impl ImageProcessor {
         log::info!("  Output format: {:?}, path: {}", effective_format, output_path);
 
         // Encode and save
-        Self::encode_and_save(&resized, output_path, effective_format, &profile.quality)?;
+        Self::encode_and_save(&resized, output_path, effective_format, &profile.quality, profile.compression)?;
 
         let new_size = std::fs::metadata(output_path)
             .map(|m| m.len())
@@ -222,65 +222,59 @@ impl ImageProcessor {
         path: &str,
         format: ImageFormat,
         quality_settings: &QualitySettings,
+        tier: CompressionTier,
     ) -> Result<(), String> {
-        let quality = match quality_settings.mode {
+        let write = |buf: Vec<u8>| -> Result<(), String> {
+            std::fs::write(path, buf).map_err(|e| {
+                log::error!("Write error ({}): {}", path, e);
+                format!("Write error: {}", e)
+            })
+        };
+
+        match quality_settings.mode {
             QualityMode::Original => {
-                let compatible = Self::ensure_compatible_color(img, format);
                 log::info!("  Saving with original quality as {:?}", format);
-                compatible
-                    .save_with_format(path, format)
-                    .map_err(|e| {
-                        log::error!("Save error ({}): {}", path, e);
-                        format!("Save error: {}", e)
-                    })?;
-                return Ok(());
+                return match format {
+                    ImageFormat::Jpeg => write(Self::encode_jpeg(img, 95, tier)?),
+                    ImageFormat::WebP => write(Self::encode_webp(img, None)?),
+                    ImageFormat::Png => write(Self::encode_png_optimized(img, tier)?),
+                    _ => {
+                        let compatible = Self::ensure_compatible_color(img, format);
+                        compatible
+                            .save_with_format(path, format)
+                            .map_err(|e| {
+                                log::error!("Save error ({}): {}", path, e);
+                                format!("Save error: {}", e)
+                            })
+                    }
+                };
             }
-            QualityMode::Quality => quality_settings.quality.max(1).min(100),
             QualityMode::TargetSize => {
                 let target_kb = quality_settings.target_size_kb.unwrap_or(100);
                 log::info!("  Saving with target size: {}KB", target_kb);
-                return Self::save_with_target_size(img, path, format, target_kb);
+                return Self::save_with_target_size(img, path, format, target_kb, tier);
             }
-        };
+            QualityMode::Quality => {}
+        }
 
+        let quality = quality_settings.quality.clamp(1, 100);
         match format {
             ImageFormat::Jpeg => {
-                // JPEG does not support alpha — convert RGBA to RGB first
-                let rgb_img = img.to_rgb8();
-                log::info!("  Encoding JPEG quality={}", quality);
-                let mut buf = Vec::new();
-                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-                rgb_img
-                    .write_with_encoder(encoder)
-                    .map_err(|e| {
-                        log::error!("JPEG encode error: {}", e);
-                        format!("JPEG encode error: {}", e)
-                    })?;
-                std::fs::write(path, buf).map_err(|e| {
-                    log::error!("JPEG write error: {}", e);
-                    format!("JPEG write error: {}", e)
-                })?;
+                log::info!(
+                    "  Encoding JPEG quality={} progressive={} optimized_huffman={}",
+                    quality,
+                    tier.jpeg_progressive(),
+                    tier.jpeg_optimized_huffman()
+                );
+                write(Self::encode_jpeg(img, quality, tier)?)
             }
             ImageFormat::Png => {
-                let compatible = Self::ensure_compatible_color(img, format);
-                log::info!("  Encoding PNG");
-                compatible
-                    .save_with_format(path, ImageFormat::Png)
-                    .map_err(|e| {
-                        log::error!("PNG save error: {}", e);
-                        format!("PNG save error: {}", e)
-                    })?;
+                log::info!("  Encoding PNG (oxipng preset={})", tier.oxipng_preset());
+                write(Self::encode_png_optimized(img, tier)?)
             }
             ImageFormat::WebP => {
-                // WebP encoder needs 8-bit color — downconvert if needed
-                let compatible = Self::ensure_compatible_color(img, format);
-                log::info!("  Encoding WebP");
-                compatible
-                    .save_with_format(path, ImageFormat::WebP)
-                    .map_err(|e| {
-                        log::error!("WebP save error: {}", e);
-                        format!("WebP save error: {}", e)
-                    })?;
+                log::info!("  Encoding WebP lossy quality={}", quality);
+                write(Self::encode_webp(img, Some(quality as f32))?)
             }
             ImageFormat::Gif => {
                 // GIF needs RGB8 or RGBA8 — downconvert 16-bit images
@@ -291,7 +285,7 @@ impl ImageProcessor {
                     .map_err(|e| {
                         log::error!("GIF save error: {}", e);
                         format!("GIF save error: {}", e)
-                    })?;
+                    })
             }
             _ => {
                 let compatible = Self::ensure_compatible_color(img, format);
@@ -300,10 +294,82 @@ impl ImageProcessor {
                     .map_err(|e| {
                         log::error!("Save error: {}", e);
                         format!("Save error: {}", e)
-                    })?;
+                    })
             }
         }
-        Ok(())
+    }
+
+    /// Encode as JPEG via jpeg-encoder; tier controls progressive scans and
+    /// optimized Huffman tables. 4:2:0 chroma subsampling below q90 (encoder default).
+    fn encode_jpeg(img: &DynamicImage, quality: u8, tier: CompressionTier) -> Result<Vec<u8>, String> {
+        let rgb = img.to_rgb8();
+        let (w, h) = rgb.dimensions();
+        let (w, h) = (
+            u16::try_from(w).map_err(|_| format!("JPEG max dimension is 65535px, got {}", w))?,
+            u16::try_from(h).map_err(|_| format!("JPEG max dimension is 65535px, got {}", h))?,
+        );
+        let mut buf = Vec::new();
+        let mut enc = jpeg_encoder::Encoder::new(&mut buf, quality.clamp(1, 100));
+        enc.set_progressive(tier.jpeg_progressive());
+        enc.set_optimized_huffman_tables(tier.jpeg_optimized_huffman());
+        enc.encode(rgb.as_raw(), w, h, jpeg_encoder::ColorType::Rgb)
+            .map_err(|e| {
+                log::error!("JPEG encode error: {}", e);
+                format!("JPEG encode error: {}", e)
+            })?;
+        Ok(buf)
+    }
+
+    /// Encode as WebP via libwebp. `None` = lossless, `Some(q)` = lossy (q clamped 1-100).
+    fn encode_webp(img: &DynamicImage, quality: Option<f32>) -> Result<Vec<u8>, String> {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let stride = w as i32 * 4;
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let len = unsafe {
+            match quality {
+                Some(q) => libwebp_sys::WebPEncodeRGBA(
+                    rgba.as_raw().as_ptr(),
+                    w as i32,
+                    h as i32,
+                    stride,
+                    q.clamp(1.0, 100.0),
+                    &mut out,
+                ),
+                None => libwebp_sys::WebPEncodeLosslessRGBA(
+                    rgba.as_raw().as_ptr(),
+                    w as i32,
+                    h as i32,
+                    stride,
+                    &mut out,
+                ),
+            }
+        };
+        if len == 0 {
+            log::error!("WebP encode failed for {}x{}", w, h);
+            return Err("WebP encode failed".to_string());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
+        unsafe { libwebp_sys::WebPFree(out as *mut core::ffi::c_void) };
+        Ok(bytes)
+    }
+
+    /// Encode as PNG, then losslessly optimize with oxipng (tier preset, safe chunks kept).
+    fn encode_png_optimized(img: &DynamicImage, tier: CompressionTier) -> Result<Vec<u8>, String> {
+        let compatible = Self::ensure_compatible_color(img, ImageFormat::Png);
+        let mut base = Vec::new();
+        compatible
+            .write_to(&mut std::io::Cursor::new(&mut base), ImageFormat::Png)
+            .map_err(|e| {
+                log::error!("PNG encode error: {}", e);
+                format!("PNG encode error: {}", e)
+            })?;
+        let mut opts = oxipng::Options::from_preset(tier.oxipng_preset());
+        opts.strip = oxipng::StripChunks::Safe;
+        oxipng::optimize_from_memory(&base, &opts).map_err(|e| {
+            log::error!("PNG optimize error: {}", e);
+            format!("PNG optimize error: {}", e)
+        })
     }
 
     /// Ensure image color type is compatible with the target format.
@@ -325,57 +391,56 @@ impl ImageProcessor {
         }
     }
 
-    /// Binary search for quality that meets target file size
+    /// Binary search for the highest quality whose output fits target_bytes.
+    fn search_quality_for_target(
+        img: &DynamicImage,
+        format: ImageFormat,
+        target_bytes: u64,
+        tier: CompressionTier,
+    ) -> Result<Vec<u8>, String> {
+        let encode = |q: u8| -> Result<Vec<u8>, String> {
+            match format {
+                ImageFormat::Jpeg => Self::encode_jpeg(img, q, tier),
+                ImageFormat::WebP => Self::encode_webp(img, Some(q as f32)),
+                _ => Err("target-size search unsupported for this format".to_string()),
+            }
+        };
+
+        let mut low: u8 = 1;
+        let mut high: u8 = 100;
+        let mut best: Option<Vec<u8>> = None;
+        while low <= high {
+            let mid = (low + high) / 2;
+            let buf = encode(mid)?;
+            if buf.len() as u64 > target_bytes {
+                high = mid - 1;
+            } else {
+                best = Some(buf);
+                low = mid + 1;
+            }
+        }
+        // Even q1 may exceed the target for huge images; write it anyway (smallest possible).
+        Ok(best.unwrap_or_else(|| encode(1).unwrap_or_default()))
+    }
+
+    /// Save with a target file size: binary-search quality for JPEG/WebP,
+    /// fall back to default save for other formats.
     fn save_with_target_size(
         img: &DynamicImage,
         path: &str,
         format: ImageFormat,
         target_kb: u32,
+        tier: CompressionTier,
     ) -> Result<(), String> {
         let target_bytes = (target_kb as u64) * 1024;
-        let rgb_img = img.to_rgb8();
 
         match format {
-            ImageFormat::Jpeg => {
-                let mut low: u8 = 1;
-                let mut high: u8 = 100;
-                let mut best_buf = Vec::new();
-
-                while low <= high {
-                    let mid = (low + high) / 2;
-                    let mut buf = Vec::new();
-                    let encoder =
-                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, mid);
-                    let _ = rgb_img.write_with_encoder(encoder);
-
-                    if buf.len() as u64 > target_bytes {
-                        high = mid - 1;
-                    } else {
-                        best_buf = buf;
-                        low = mid + 1;
-                    }
-                }
-
-                if best_buf.is_empty() {
-                    let mut buf = Vec::new();
-                    let encoder =
-                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 1);
-                    rgb_img
-                        .write_with_encoder(encoder)
-                        .map_err(|e| {
-                            log::error!("JPEG encode error: {}", e);
-                            format!("JPEG encode error: {}", e)
-                        })?;
-                    std::fs::write(path, buf).map_err(|e| {
-                        log::error!("JPEG write error: {}", e);
-                        format!("JPEG write error: {}", e)
-                    })?;
-                } else {
-                    std::fs::write(path, best_buf).map_err(|e| {
-                        log::error!("JPEG write error: {}", e);
-                        format!("JPEG write error: {}", e)
-                    })?;
-                }
+            ImageFormat::Jpeg | ImageFormat::WebP => {
+                let buf = Self::search_quality_for_target(img, format, target_bytes, tier)?;
+                std::fs::write(path, buf).map_err(|e| {
+                    log::error!("Write error ({}): {}", path, e);
+                    format!("Write error: {}", e)
+                })
             }
             _ => {
                 let compatible = Self::ensure_compatible_color(img, format);
@@ -384,10 +449,9 @@ impl ImageProcessor {
                     .map_err(|e| {
                         log::error!("Save error (target size): {}", e);
                         format!("Save error: {}", e)
-                    })?;
+                    })
             }
         }
-        Ok(())
     }
 
     /// Build the filename stem (without extension) with appropriate suffix applied.
@@ -682,6 +746,7 @@ mod tests {
             resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
             output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
             quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
+            compression: CompressionTier::Balanced,
             memory_budget_mb: 1024,
         };
 
@@ -701,6 +766,7 @@ mod tests {
             resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
             output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
             quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
+            compression: CompressionTier::Balanced,
             memory_budget_mb: 1, // 1MB
         };
 
@@ -722,6 +788,7 @@ mod tests {
             resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
             output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
             quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
+            compression: CompressionTier::Balanced,
             memory_budget_mb: 1, // 1MB — way too small
         };
 
@@ -1031,6 +1098,7 @@ mod tests {
                 adjust_dpi: false,
                 dpi: 96,
             },
+            compression: CompressionTier::Balanced,
             memory_budget_mb: 1024,
         };
 
@@ -1040,6 +1108,224 @@ mod tests {
 
         let _ = fs::remove_file(&input);
         let _ = fs::remove_file(&output);
+    }
+
+    /// Deterministic photo-ish test image (gradient + structured variation)
+    fn gradient_photo(w: u32, h: u32) -> DynamicImage {
+        let mut img = image::RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let jitter = ((x * y) % 7) as u32;
+                let p = Rgb([
+                    (x * 255 / w.max(1) + jitter) as u8,
+                    (y * 255 / h.max(1) + jitter) as u8,
+                    ((x + y) * 255 / (w + h).max(1) + jitter) as u8,
+                ]);
+                img.put_pixel(x, y, p);
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    #[test]
+    fn test_webp_lossy_quality_affects_size() {
+        let img = gradient_photo(400, 300);
+        let low = ImageProcessor::encode_webp(&img, Some(20.0)).unwrap();
+        let high = ImageProcessor::encode_webp(&img, Some(90.0)).unwrap();
+        assert!(low.len() < high.len(), "q20 ({}) should be smaller than q90 ({})", low.len(), high.len());
+        // both must decode back to the same dimensions
+        let dec = image::load_from_memory(&low).unwrap();
+        assert_eq!(dec.dimensions(), (400, 300));
+    }
+
+    /// Photo-like fixture: gradient + per-pixel pseudo-random noise.
+    /// Lossless encoders can't predict noise, mirroring real photos.
+    fn noisy_photo(w: u32, h: u32) -> DynamicImage {
+        let mut img = image::RgbImage::new(w, h);
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let n = (rnd() % 32) as u32;
+                let p = Rgb([
+                    (x * 200 / w.max(1) + n) as u8,
+                    (y * 200 / h.max(1) + n) as u8,
+                    ((x + y) * 200 / (w + h).max(1) + n) as u8,
+                ]);
+                img.put_pixel(x, y, p);
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    #[test]
+    fn test_webp_lossy_smaller_than_lossless() {
+        let img = noisy_photo(400, 300);
+        let lossy = ImageProcessor::encode_webp(&img, Some(75.0)).unwrap();
+        let lossless = ImageProcessor::encode_webp(&img, None).unwrap();
+        assert!(
+            lossy.len() < lossless.len(),
+            "lossy {} vs lossless {}",
+            lossy.len(),
+            lossless.len()
+        );
+    }
+
+    #[test]
+    fn test_jpeg_new_encoder_smaller_than_legacy() {
+        let img = gradient_photo(400, 300);
+        let rgb = img.to_rgb8();
+        let mut legacy = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut legacy, 75);
+        DynamicImage::ImageRgb8(rgb)
+            .write_with_encoder(enc)
+            .unwrap();
+        let modern = ImageProcessor::encode_jpeg(&img, 75, CompressionTier::Balanced).unwrap();
+        assert!(
+            modern.len() < legacy.len(),
+            "modern {} vs legacy {}",
+            modern.len(),
+            legacy.len()
+        );
+    }
+
+    #[test]
+    fn test_jpeg_balanced_roundtrip_not_corrupt() {
+        let img = gradient_photo(200, 150);
+        let out = ImageProcessor::encode_jpeg(&img, 75, CompressionTier::Balanced).unwrap();
+        let dec = image::load_from_memory(&out).unwrap().to_rgb8();
+        let orig = img.to_rgb8();
+        let mut total: u64 = 0;
+        for y in 0..150 {
+            for x in 0..200 {
+                let a = orig.get_pixel(x, y);
+                let b = dec.get_pixel(x, y);
+                for c in 0..3 {
+                    total += (a.0[c] as i32 - b.0[c] as i32).unsigned_abs() as u64;
+                }
+            }
+        }
+        let avg = total as f64 / (200.0 * 150.0 * 3.0);
+        assert!(avg < 4.0, "avg per-channel error too high: {}", avg);
+    }
+
+    #[test]
+    fn test_png_optimized_smaller_than_default() {
+        let img = gradient_photo(400, 300);
+        let mut default_png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut default_png), ImageFormat::Png)
+            .unwrap();
+        let optimized = ImageProcessor::encode_png_optimized(&img, CompressionTier::Balanced).unwrap();
+        assert!(
+            optimized.len() < default_png.len(),
+            "optimized {} vs default {}",
+            optimized.len(),
+            default_png.len()
+        );
+        // lossless: pixel-exact roundtrip
+        let dec = image::load_from_memory(&optimized).unwrap().to_rgb8();
+        assert_eq!(dec, img.to_rgb8());
+    }
+
+    #[test]
+    fn test_encode_and_save_webp_quality_mode_uses_lossy() {
+        let dir = test_output_dir();
+        let img = gradient_photo(400, 300);
+        let tier = CompressionTier::Balanced;
+        let qs = |q: u8| QualitySettings {
+            mode: QualityMode::Quality,
+            quality: q,
+            target_size_kb: None,
+            adjust_dpi: false,
+            dpi: 96,
+        };
+        let low_path = format!("{}\\webp_q20.webp", dir);
+        let high_path = format!("{}\\webp_q90.webp", dir);
+        ImageProcessor::encode_and_save(&img, &low_path, ImageFormat::WebP, &qs(20), tier).unwrap();
+        ImageProcessor::encode_and_save(&img, &high_path, ImageFormat::WebP, &qs(90), tier).unwrap();
+        let low_size = std::fs::metadata(&low_path).unwrap().len();
+        let high_size = std::fs::metadata(&high_path).unwrap().len();
+        assert!(low_size < high_size, "quality must affect WebP output ({} vs {})", low_size, high_size);
+        let _ = fs::remove_file(&low_path);
+        let _ = fs::remove_file(&high_path);
+    }
+
+    #[test]
+    fn test_webp_original_mode_is_lossless() {
+        let dir = test_output_dir();
+        let img = gradient_photo(120, 90);
+        let path = format!("{}\\webp_lossless.webp", dir);
+        let qs = QualitySettings {
+            mode: QualityMode::Original,
+            quality: 0,
+            target_size_kb: None,
+            adjust_dpi: false,
+            dpi: 96,
+        };
+        ImageProcessor::encode_and_save(&img, &path, ImageFormat::WebP, &qs, CompressionTier::Balanced).unwrap();
+        let dec = image::load_from_memory(&fs::read(&path).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(dec, img.to_rgb8(), "Original mode WebP must be pixel-exact");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Decode a WebP buffer with the reference libwebp decoder and return RGBA pixels.
+    /// Independent of the image crate's decoder — guards against encoder/decoder
+    /// blind spots within the same crate family.
+    fn libwebp_decode_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
+        let mut w: i32 = 0;
+        let mut h: i32 = 0;
+        let ptr = unsafe {
+            libwebp_sys::WebPDecodeRGBA(bytes.as_ptr(), bytes.len(), &mut w, &mut h)
+        };
+        assert!(!ptr.is_null(), "reference libwebp failed to decode output");
+        let n = w as usize * h as usize * 4;
+        let pixels = unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec();
+        unsafe { libwebp_sys::WebPFree(ptr as *mut core::ffi::c_void) };
+        (pixels, w as u32, h as u32)
+    }
+
+    #[test]
+    fn test_webp_output_decodable_by_reference_libwebp() {
+        let img = noisy_photo(200, 160);
+        let orig = img.to_rgba8();
+
+        // Lossless output must roundtrip pixel-exact through the reference decoder.
+        let lossless = ImageProcessor::encode_webp(&img, None).unwrap();
+        let (px, w, h) = libwebp_decode_rgba(&lossless);
+        assert_eq!((w, h), (200, 160));
+        assert_eq!(px, orig.as_raw().as_slice(), "lossless WebP must be pixel-exact");
+
+        // Lossy output must decode with correct dimensions and bounded error.
+        let lossy = ImageProcessor::encode_webp(&img, Some(60.0)).unwrap();
+        let (px, w, h) = libwebp_decode_rgba(&lossy);
+        assert_eq!((w, h), (200, 160));
+        let mut total: u64 = 0;
+        for (a, b) in px.iter().zip(orig.as_raw().iter()) {
+            total += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let avg = total as f64 / px.len() as f64;
+        assert!(avg < 8.0, "lossy WebP avg per-channel error too high: {}", avg);
+    }
+
+    #[test]
+    fn test_save_with_target_size_webp() {
+        let dir = test_output_dir();
+        let img = gradient_photo(400, 300);
+        let path = format!("{}\\webp_target.webp", dir);
+        ImageProcessor::save_with_target_size(&img, &path, ImageFormat::WebP, 30, CompressionTier::Balanced).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size <= 30 * 1024, "output {} must be <= 30KB", size);
+        assert!(size > 0);
+        let dec = image::load_from_memory(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(dec.dimensions(), (400, 300));
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
@@ -1067,6 +1353,7 @@ mod tests {
                 adjust_dpi: false,
                 dpi: 96,
             },
+            compression: CompressionTier::Balanced,
             memory_budget_mb: 1024,
         };
 
