@@ -1,4 +1,5 @@
 use crate::config::*;
+use crate::memgate::MemoryGate;
 use image::imageops::FilterType;
 use image::ImageReader;
 use image::{DynamicImage, GenericImageView, ImageFormat};
@@ -35,24 +36,6 @@ impl ImageProcessor {
         (target_w.max(1), target_h.max(1))
     }
 
-    /// Partition files into (parallel_group, serial_group) based on memory budget.
-    pub fn partition_by_memory(files: &[FileMetadata], profile: &Profile) -> (Vec<FileMetadata>, Vec<FileMetadata>) {
-        let budget_bytes = (profile.memory_budget_mb as u64) * 1024 * 1024;
-        let mut parallel = Vec::new();
-        let mut serial = Vec::new();
-
-        for file in files {
-            let (tw, th) = Self::compute_target_dimensions(file.width, file.height, &profile.resize);
-            let estimated = Self::estimate_memory_bytes(file.width, file.height, tw, th);
-            if estimated > budget_bytes {
-                serial.push(file.clone());
-            } else {
-                parallel.push(file.clone());
-            }
-        }
-
-        (parallel, serial)
-    }
 }
 
 impl ImageProcessor {
@@ -101,8 +84,9 @@ impl ImageProcessor {
             .map(|m| m.len())
             .unwrap_or(0);
 
-        // Resize
-        let resized = Self::resize_image(&img, &profile.resize);
+        // Resize (consumes img: the original decode buffer is freed right
+        // after the resized copy exists, halving peak memory on big shrinks)
+        let resized = Self::resize_image(img, &profile.resize);
 
         // Ensure output directory exists
         if let Some(parent) = Path::new(output_path).parent() {
@@ -138,11 +122,13 @@ impl ImageProcessor {
         })
     }
 
-    /// Resize image according to settings
-    fn resize_image(img: &DynamicImage, settings: &ResizeSettings) -> DynamicImage {
+    /// Resize image according to settings. Takes ownership so the decode
+    /// buffer is released as soon as the resized copy exists (no-op paths
+    /// return the input unchanged, avoiding a full-image clone).
+    fn resize_image(img: DynamicImage, settings: &ResizeSettings) -> DynamicImage {
         let (orig_w, orig_h) = img.dimensions();
         if orig_w == 0 || orig_h == 0 {
-            return img.clone();
+            return img;
         }
 
         let (target_w, target_h) = match settings.unit {
@@ -178,7 +164,7 @@ impl ImageProcessor {
                 }
                 ResizeMode::ShrinkOnly => {
                     if target_w >= orig_w && target_h >= orig_h {
-                        return img.clone();
+                        return img;
                     }
                     let ratio = (target_w as f64 / orig_w as f64)
                         .min(target_h as f64 / orig_h as f64);
@@ -224,35 +210,27 @@ impl ImageProcessor {
         quality_settings: &QualitySettings,
         tier: CompressionTier,
     ) -> Result<(), String> {
-        let write = |buf: Vec<u8>| -> Result<(), String> {
-            std::fs::write(path, buf).map_err(|e| {
-                log::error!("Write error ({}): {}", path, e);
-                format!("Write error: {}", e)
-            })
+        let write = |buf: Vec<u8>| -> Result<(), String> { Self::atomic_write(path, &buf) };
+        let dpi = if quality_settings.adjust_dpi {
+            Some(quality_settings.dpi)
+        } else {
+            None
         };
 
         match quality_settings.mode {
             QualityMode::Original => {
                 log::info!("  Saving with original quality as {:?}", format);
                 return match format {
-                    ImageFormat::Jpeg => write(Self::encode_jpeg(img, 95, tier)?),
+                    ImageFormat::Jpeg => write(Self::encode_jpeg(img, 95, tier, dpi)?),
                     ImageFormat::WebP => write(Self::encode_webp(img, None)?),
                     ImageFormat::Png => write(Self::encode_png_optimized(img, tier)?),
-                    _ => {
-                        let compatible = Self::ensure_compatible_color(img, format);
-                        compatible
-                            .save_with_format(path, format)
-                            .map_err(|e| {
-                                log::error!("Save error ({}): {}", path, e);
-                                format!("Save error: {}", e)
-                            })
-                    }
+                    _ => Self::save_dynamic_atomically(img, path, format),
                 };
             }
             QualityMode::TargetSize => {
                 let target_kb = quality_settings.target_size_kb.unwrap_or(100);
                 log::info!("  Saving with target size: {}KB", target_kb);
-                return Self::save_with_target_size(img, path, format, target_kb, tier);
+                return Self::save_with_target_size(img, path, format, target_kb, tier, dpi);
             }
             QualityMode::Quality => {}
         }
@@ -266,7 +244,7 @@ impl ImageProcessor {
                     tier.jpeg_progressive(),
                     tier.jpeg_optimized_huffman()
                 );
-                write(Self::encode_jpeg(img, quality, tier)?)
+                write(Self::encode_jpeg(img, quality, tier, dpi)?)
             }
             ImageFormat::Png => {
                 log::info!("  Encoding PNG (oxipng preset={})", tier.oxipng_preset());
@@ -277,31 +255,21 @@ impl ImageProcessor {
                 write(Self::encode_webp(img, Some(quality as f32))?)
             }
             ImageFormat::Gif => {
-                // GIF needs RGB8 or RGBA8 — downconvert 16-bit images
-                let compatible = Self::ensure_compatible_color(img, format);
                 log::info!("  Encoding GIF");
-                compatible
-                    .save_with_format(path, ImageFormat::Gif)
-                    .map_err(|e| {
-                        log::error!("GIF save error: {}", e);
-                        format!("GIF save error: {}", e)
-                    })
+                Self::save_dynamic_atomically(img, path, ImageFormat::Gif)
             }
-            _ => {
-                let compatible = Self::ensure_compatible_color(img, format);
-                compatible
-                    .save_with_format(path, format)
-                    .map_err(|e| {
-                        log::error!("Save error: {}", e);
-                        format!("Save error: {}", e)
-                    })
-            }
+            _ => Self::save_dynamic_atomically(img, path, format),
         }
     }
 
     /// Encode as JPEG via jpeg-encoder; tier controls progressive scans and
     /// optimized Huffman tables. 4:2:0 chroma subsampling below q90 (encoder default).
-    fn encode_jpeg(img: &DynamicImage, quality: u8, tier: CompressionTier) -> Result<Vec<u8>, String> {
+    fn encode_jpeg(
+        img: &DynamicImage,
+        quality: u8,
+        tier: CompressionTier,
+        dpi: Option<u32>,
+    ) -> Result<Vec<u8>, String> {
         let rgb = img.to_rgb8();
         let (w, h) = rgb.dimensions();
         let (w, h) = (
@@ -312,6 +280,10 @@ impl ImageProcessor {
         let mut enc = jpeg_encoder::Encoder::new(&mut buf, quality.clamp(1, 100));
         enc.set_progressive(tier.jpeg_progressive());
         enc.set_optimized_huffman_tables(tier.jpeg_optimized_huffman());
+        if let Some(dpi) = dpi {
+            let d = dpi.clamp(1, u16::MAX as u32) as u16;
+            enc.set_density(jpeg_encoder::PixelDensity::dpi(d));
+        }
         enc.encode(rgb.as_raw(), w, h, jpeg_encoder::ColorType::Rgb)
             .map_err(|e| {
                 log::error!("JPEG encode error: {}", e);
@@ -397,10 +369,11 @@ impl ImageProcessor {
         format: ImageFormat,
         target_bytes: u64,
         tier: CompressionTier,
+        dpi: Option<u32>,
     ) -> Result<Vec<u8>, String> {
         let encode = |q: u8| -> Result<Vec<u8>, String> {
             match format {
-                ImageFormat::Jpeg => Self::encode_jpeg(img, q, tier),
+                ImageFormat::Jpeg => Self::encode_jpeg(img, q, tier, dpi),
                 ImageFormat::WebP => Self::encode_webp(img, Some(q as f32)),
                 _ => Err("target-size search unsupported for this format".to_string()),
             }
@@ -431,27 +404,61 @@ impl ImageProcessor {
         format: ImageFormat,
         target_kb: u32,
         tier: CompressionTier,
+        dpi: Option<u32>,
     ) -> Result<(), String> {
         let target_bytes = (target_kb as u64) * 1024;
 
         match format {
             ImageFormat::Jpeg | ImageFormat::WebP => {
-                let buf = Self::search_quality_for_target(img, format, target_bytes, tier)?;
+                let buf = Self::search_quality_for_target(img, format, target_bytes, tier, dpi)?;
                 std::fs::write(path, buf).map_err(|e| {
                     log::error!("Write error ({}): {}", path, e);
                     format!("Write error: {}", e)
                 })
             }
-            _ => {
-                let compatible = Self::ensure_compatible_color(img, format);
-                compatible
-                    .save_with_format(path, format)
-                    .map_err(|e| {
-                        log::error!("Save error (target size): {}", e);
-                        format!("Save error: {}", e)
-                    })
+            _ => Self::save_dynamic_atomically(img, path, format),
+        }
+    }
+
+    /// Write bytes to `path` atomically: encode to a sibling temp file first,
+    /// then rename over the target. A crash or IO error mid-write can never
+    /// leave a truncated destination (the original file survives untouched).
+    fn atomic_write(path: &str, bytes: &[u8]) -> Result<(), String> {
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let target = Path::new(path);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = target.with_extension(format!("tmp{}", seq));
+        std::fs::write(&tmp, bytes).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            log::error!("Write error ({}): {}", tmp.display(), e);
+            format!("Write error: {}", e)
+        })?;
+        match std::fs::rename(&tmp, target) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                log::error!("Rename error ({} -> {}): {}", tmp.display(), path, e);
+                Err(format!("Write error: {}", e))
             }
         }
+    }
+
+    /// Encode a DynamicImage to `format` in memory, then atomically write it.
+    /// Used for formats without a dedicated encoder path (GIF, passthrough).
+    fn save_dynamic_atomically(
+        img: &DynamicImage,
+        path: &str,
+        format: ImageFormat,
+    ) -> Result<(), String> {
+        let compatible = Self::ensure_compatible_color(img, format);
+        let mut buf = Vec::new();
+        compatible
+            .write_to(&mut std::io::Cursor::new(&mut buf), format)
+            .map_err(|e| {
+                log::error!("Encode error ({}): {}", path, e);
+                format!("Encode error: {}", e)
+            })?;
+        Self::atomic_write(path, &buf)
     }
 
     /// Build the filename stem (without extension) with appropriate suffix applied.
@@ -507,7 +514,21 @@ impl ImageProcessor {
         };
 
         match output_settings.operation {
-            OutputOperation::Overwrite => file_path.to_string(),
+            OutputOperation::Overwrite => {
+                // Format change under Overwrite: write beside the original with the
+                // new extension instead of stuffing new-format bytes into the old
+                // path (which would leave content/extension mismatched).
+                if target_ext != original_ext {
+                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                    path.parent()
+                        .unwrap_or(path)
+                        .join(format!("{}.{}", stem, target_ext))
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    file_path.to_string()
+                }
+            }
             OutputOperation::SameDir => {
                 let stem = path
                     .file_stem()
@@ -559,7 +580,8 @@ impl ImageProcessor {
         }
     }
 
-    /// Batch process multiple files: parallel group via rayon, serial group sequentially.
+    /// Batch process files via rayon, with a memory gate capping how much
+    /// estimated image memory may be in flight at once (memory_budget_mb).
     pub fn batch_process(
         files: &[FileMetadata],
         profile: &Profile,
@@ -567,14 +589,13 @@ impl ImageProcessor {
         stop_flag: &Arc<AtomicBool>,
         progress_callback: impl Fn(ProgressEvent) + Send + Sync,
     ) -> BatchResult {
-        let (parallel_files, serial_files) = Self::partition_by_memory(files, profile);
+        let gate = MemoryGate::new(profile.memory_budget_mb as u64 * 1024 * 1024);
         let total = files.len() as u32;
         let total_original_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
         let processed_bytes = Arc::new(AtomicU64::new(0));
         let processed_count = Arc::new(AtomicU64::new(0));
 
-        // Process parallel group with rayon
-        let parallel_results: Vec<ProcessResult> = parallel_files
+        let results: Vec<ProcessResult> = files
             .par_iter()
             .filter_map(|file| {
                 if stop_flag.load(Ordering::Relaxed) {
@@ -587,6 +608,13 @@ impl ImageProcessor {
                         status: "skipped".to_string(),
                     });
                 }
+
+                // Reserve estimated memory before decoding; large files simply
+                // wait their turn instead of blowing past the budget together.
+                let (tw, th) =
+                    Self::compute_target_dimensions(file.width, file.height, &profile.resize);
+                let cost = Self::estimate_memory_bytes(file.width, file.height, tw, th);
+                let _lease = gate.acquire(cost);
 
                 let output_path =
                     Self::compute_output_path(&file.path, source_dir, &profile.output);
@@ -604,7 +632,8 @@ impl ImageProcessor {
                     }
                 };
 
-                let bytes = processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed) + file.size_bytes;
+                let bytes =
+                    processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed) + file.size_bytes;
                 let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                 progress_callback(ProgressEvent {
@@ -621,57 +650,6 @@ impl ImageProcessor {
                 Some(result)
             })
             .collect();
-
-        // Process serial group one at a time
-        let mut serial_results = Vec::new();
-        for file in &serial_files {
-            if stop_flag.load(Ordering::Relaxed) {
-                processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed);
-                processed_count.fetch_add(1, Ordering::Relaxed);
-                serial_results.push(ProcessResult {
-                    file: file.path.clone(),
-                    original_size: file.size_bytes,
-                    new_size: 0,
-                    status: "skipped".to_string(),
-                });
-                continue;
-            }
-
-            let output_path =
-                Self::compute_output_path(&file.path, source_dir, &profile.output);
-
-            let result = match Self::process_file(&file.path, &output_path, profile) {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("FAILED [{}]: {}", file.path, e);
-                    ProcessResult {
-                        file: file.path.clone(),
-                        original_size: file.size_bytes,
-                        new_size: 0,
-                        status: format!("failed: {}", e),
-                    }
-                }
-            };
-
-            let bytes = processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed) + file.size_bytes;
-            let current = processed_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-            progress_callback(ProgressEvent {
-                total,
-                current: current as u32,
-                file: file.path.clone(),
-                original_size: result.original_size,
-                new_size: result.new_size,
-                status: result.status.clone(),
-                total_original_bytes,
-                processed_bytes: bytes,
-            });
-
-            serial_results.push(result);
-        }
-
-        let mut results = parallel_results;
-        results.extend(serial_results);
 
         let success = results
             .iter()
@@ -735,67 +713,6 @@ mod tests {
         assert_eq!(bytes, 0);
     }
 
-    #[test]
-    fn test_partition_small_files_all_parallel() {
-        let files = vec![
-            FileMetadata { path: "a.jpg".into(), size_bytes: 1000, extension: "jpg".into(), width: 500, height: 500 },
-            FileMetadata { path: "b.png".into(), size_bytes: 2000, extension: "png".into(), width: 800, height: 600 },
-        ];
-        let profile = Profile {
-            name: "test".into(),
-            resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
-            output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
-            quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
-            compression: CompressionTier::Balanced,
-            memory_budget_mb: 1024,
-        };
-
-        let (parallel, serial) = ImageProcessor::partition_by_memory(&files, &profile);
-        assert_eq!(parallel.len(), 2);
-        assert_eq!(serial.len(), 0);
-    }
-
-    #[test]
-    fn test_partition_large_file_goes_to_serial() {
-        let files = vec![
-            FileMetadata { path: "small.jpg".into(), size_bytes: 1000, extension: "jpg".into(), width: 100, height: 100 },
-            FileMetadata { path: "huge.jpg".into(), size_bytes: 5000, extension: "jpg".into(), width: 10000, height: 10000 },
-        ];
-        let profile = Profile {
-            name: "test".into(),
-            resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
-            output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
-            quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
-            compression: CompressionTier::Balanced,
-            memory_budget_mb: 1, // 1MB
-        };
-
-        let (parallel, serial) = ImageProcessor::partition_by_memory(&files, &profile);
-        assert_eq!(parallel.len(), 1);
-        assert_eq!(parallel[0].path, "small.jpg");
-        assert_eq!(serial.len(), 1);
-        assert_eq!(serial[0].path, "huge.jpg");
-    }
-
-    #[test]
-    fn test_partition_all_files_over_budget() {
-        let files = vec![
-            FileMetadata { path: "a.jpg".into(), size_bytes: 1000, extension: "jpg".into(), width: 10000, height: 10000 },
-            FileMetadata { path: "b.jpg".into(), size_bytes: 2000, extension: "jpg".into(), width: 20000, height: 20000 },
-        ];
-        let profile = Profile {
-            name: "test".into(),
-            resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
-            output: OutputSettings { operation: OutputOperation::SameDir, custom_dir: None, format: OutputFormat::SameAsOriginal, naming: NamingMode::KeepOriginal, custom_suffix: None },
-            quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
-            compression: CompressionTier::Balanced,
-            memory_budget_mb: 1, // 1MB — way too small
-        };
-
-        let (parallel, serial) = ImageProcessor::partition_by_memory(&files, &profile);
-        assert_eq!(parallel.len(), 0);
-        assert_eq!(serial.len(), 2);
-    }
 
     fn create_test_image(path: &str, width: u32, height: u32) {
         let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(width, height, Rgb([255u8, 0, 0]));
@@ -819,7 +736,7 @@ mod tests {
             keep_aspect_ratio: true,
         };
 
-        let resized = ImageProcessor::resize_image(&img, &settings);
+        let resized = ImageProcessor::resize_image(img, &settings);
         let (w, h) = resized.dimensions();
 
         assert_eq!(w, 200);
@@ -837,7 +754,7 @@ mod tests {
             keep_aspect_ratio: true,
         };
 
-        let resized = ImageProcessor::resize_image(&img, &settings);
+        let resized = ImageProcessor::resize_image(img, &settings);
         let (w, h) = resized.dimensions();
 
         assert_eq!(w, 100);
@@ -855,7 +772,7 @@ mod tests {
             keep_aspect_ratio: true,
         };
 
-        let resized = ImageProcessor::resize_image(&img, &settings);
+        let resized = ImageProcessor::resize_image(img, &settings);
         let (w, h) = resized.dimensions();
 
         assert_eq!(w, 80);
@@ -873,7 +790,7 @@ mod tests {
             keep_aspect_ratio: true,
         };
 
-        let resized = ImageProcessor::resize_image(&img, &settings);
+        let resized = ImageProcessor::resize_image(img, &settings);
         let (w, h) = resized.dimensions();
 
         assert_eq!(w, 50);
@@ -1185,7 +1102,7 @@ mod tests {
         DynamicImage::ImageRgb8(rgb)
             .write_with_encoder(enc)
             .unwrap();
-        let modern = ImageProcessor::encode_jpeg(&img, 75, CompressionTier::Balanced).unwrap();
+        let modern = ImageProcessor::encode_jpeg(&img, 75, CompressionTier::Balanced, None).unwrap();
         assert!(
             modern.len() < legacy.len(),
             "modern {} vs legacy {}",
@@ -1197,7 +1114,7 @@ mod tests {
     #[test]
     fn test_jpeg_balanced_roundtrip_not_corrupt() {
         let img = gradient_photo(200, 150);
-        let out = ImageProcessor::encode_jpeg(&img, 75, CompressionTier::Balanced).unwrap();
+        let out = ImageProcessor::encode_jpeg(&img, 75, CompressionTier::Balanced, None).unwrap();
         let dec = image::load_from_memory(&out).unwrap().to_rgb8();
         let orig = img.to_rgb8();
         let mut total: u64 = 0;
@@ -1319,13 +1236,132 @@ mod tests {
         let dir = test_output_dir();
         let img = gradient_photo(400, 300);
         let path = format!("{}\\webp_target.webp", dir);
-        ImageProcessor::save_with_target_size(&img, &path, ImageFormat::WebP, 30, CompressionTier::Balanced).unwrap();
+        ImageProcessor::save_with_target_size(&img, &path, ImageFormat::WebP, 30, CompressionTier::Balanced, None).unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size <= 30 * 1024, "output {} must be <= 30KB", size);
         assert!(size > 0);
         let dec = image::load_from_memory(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(dec.dimensions(), (400, 300));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_atomic_write_replaces_existing_and_cleans_up() {
+        let dir = test_output_dir();
+        let path = format!("{}\\atomic_target.bin", dir);
+        std::fs::write(&path, b"old").unwrap();
+        ImageProcessor::atomic_write(&path, b"new-content").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-content");
+        // no leftover temp siblings
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("atomic_target") && n != "atomic_target.bin")
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {:?}", leftovers);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_atomic_write_failure_keeps_original() {
+        let dir = test_output_dir();
+        let path = format!("{}\\atomic_keep.bin", dir);
+        std::fs::write(&path, b"precious").unwrap();
+        // write to an invalid path must fail without touching the original
+        let bad = format!("{}\\nonexistent_dir\\x.bin", dir);
+        let result = ImageProcessor::atomic_write(&bad, b"whatever");
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"precious");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_overwrite_with_format_change_gets_correct_extension() {
+        let settings = OutputSettings {
+            operation: OutputOperation::Overwrite,
+            custom_dir: None,
+            format: OutputFormat::WebP,
+            naming: NamingMode::KeepOriginal,
+            custom_suffix: None,
+        };
+        let out = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+        assert!(out.ends_with("001.webp"), "webp bytes must not land in a .jpg path, got: {}", out);
+        assert!(!out.ends_with("001.jpg.webp"), "stem must not be doubled: {}", out);
+    }
+
+    #[test]
+    fn test_overwrite_same_format_keeps_path() {
+        let settings = OutputSettings {
+            operation: OutputOperation::Overwrite,
+            custom_dir: None,
+            format: OutputFormat::SameAsOriginal,
+            naming: NamingMode::KeepOriginal,
+            custom_suffix: None,
+        };
+        let out = ImageProcessor::compute_output_path(
+            "C:\\comics\\vol1\\001.jpg",
+            "C:\\comics",
+            &settings,
+        );
+        assert_eq!(out, "C:\\comics\\vol1\\001.jpg");
+    }
+
+    #[test]
+    fn test_batch_process_end_to_end() {
+        let dir = test_output_dir();
+        let in1 = format!("{}\\batch_a.jpg", dir);
+        let in2 = format!("{}\\batch_b.jpg", dir);
+        create_test_image(&in1, 80, 60);
+        create_test_image(&in2, 80, 60);
+        let files = vec![
+            FileMetadata { path: in1.clone(), size_bytes: 500, extension: "jpg".into(), width: 80, height: 60 },
+            FileMetadata { path: in2.clone(), size_bytes: 500, extension: "jpg".into(), width: 80, height: 60 },
+        ];
+        let profile = Profile {
+            name: "batch-test".to_string(),
+            resize: ResizeSettings { width: 100, height: 100, unit: SizeUnit::Percentage, mode: ResizeMode::Fit, keep_aspect_ratio: true },
+            output: OutputSettings { operation: OutputOperation::Overwrite, custom_dir: None, format: OutputFormat::Jpeg, naming: NamingMode::KeepOriginal, custom_suffix: None },
+            quality: QualitySettings { mode: QualityMode::Quality, quality: 80, target_size_kb: None, adjust_dpi: false, dpi: 96 },
+            compression: CompressionTier::Balanced,
+            memory_budget_mb: 1,
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(AtomicU64::new(0));
+        let ev = Arc::clone(&events);
+        let result = ImageProcessor::batch_process(&files, &profile, &dir, &stop, move |_e| {
+            ev.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(result.total_files, 2);
+        assert_eq!(result.success, 2);
+        assert_eq!(result.failed, 0);
+        assert_eq!(events.load(Ordering::Relaxed), 2);
+        let _ = fs::remove_file(&in1);
+        let _ = fs::remove_file(&in2);
+    }
+
+    #[test]
+    fn test_jpeg_dpi_written_into_jfif_header() {
+        let img = gradient_photo(100, 80);
+        let out =
+            ImageProcessor::encode_jpeg(&img, 80, CompressionTier::Balanced, Some(144)).unwrap();
+        assert_eq!(&out[0..2], &[0xFF, 0xD8]);
+        assert_eq!(&out[2..4], &[0xFF, 0xE0], "first marker must be APP0/JFIF");
+        assert_eq!(&out[6..11], b"JFIF\x00");
+        assert_eq!(out[13], 1, "units byte must be 1 (dots per inch)");
+        assert_eq!(u16::from_be_bytes([out[14], out[15]]), 144, "xdensity");
+        assert_eq!(u16::from_be_bytes([out[16], out[17]]), 144, "ydensity");
+    }
+
+    #[test]
+    fn test_jpeg_without_dpi_keeps_default_header() {
+        let img = gradient_photo(100, 80);
+        let out = ImageProcessor::encode_jpeg(&img, 80, CompressionTier::Balanced, None).unwrap();
+        assert_eq!(out[13], 0, "units byte must be 0 when no dpi requested");
     }
 
     #[test]

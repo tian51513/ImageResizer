@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod memgate;
 mod processor;
 mod scanner;
 mod state;
