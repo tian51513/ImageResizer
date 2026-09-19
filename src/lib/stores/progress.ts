@@ -1,7 +1,7 @@
 import { writable, derived } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ProgressEvent, BatchResult, FileMetadata, Profile } from "../types";
+import type { ProgressBatch, BatchResult, FileMetadata, Profile, ProcessResult } from "../types";
 
 function createProgressStore() {
   const isProcessing = writable<boolean>(false);
@@ -9,7 +9,8 @@ function createProgressStore() {
   const total = writable<number>(0);
   const totalOriginalBytes = writable<number>(0);
   const processedBytes = writable<number>(0);
-  const results = writable<Array<{file: string; original_size: number; new_size: number; status: string}>>([]);
+  const results = writable<ProcessResult[]>([]);
+  const lastError = writable<string | null>(null);
   const batchResult = writable<BatchResult | null>(null);
 
   const percentage = derived(
@@ -54,20 +55,17 @@ function createProgressStore() {
     batchResult.set(null);
     isProcessing.set(true);
 
-    unlistenProgress = await listen<ProgressEvent>("progress_update", (e) => {
-      current.set(e.payload.current);
-      total.set(e.payload.total);
-      totalOriginalBytes.set(e.payload.total_original_bytes);
-      processedBytes.set(e.payload.processed_bytes);
-      results.update((r) => [
-        ...r,
-        {
-          file: e.payload.file,
-          original_size: e.payload.original_size,
-          new_size: e.payload.new_size,
-          status: e.payload.status,
-        },
-      ]);
+    unlistenProgress = await listen<ProgressBatch>("progress_update", (e) => {
+      const { last, results: rows } = e.payload;
+      current.set(last.current);
+      total.set(last.total);
+      totalOriginalBytes.set(last.total_original_bytes);
+      processedBytes.set(last.processed_bytes);
+      // append in place — no full-array rebuild per event
+      results.update((r) => {
+        r.push(...rows);
+        return r;
+      });
     });
 
     unlistenComplete = await listen<BatchResult>("processing_complete", (e) => {
@@ -83,6 +81,7 @@ function createProgressStore() {
       });
     } catch (e) {
       isProcessing.set(false);
+      lastError.set(String(e));
       console.error("Failed to start processing:", e);
     }
   }
@@ -91,6 +90,7 @@ function createProgressStore() {
     try {
       await invoke("stop_processing");
     } catch (e) {
+      lastError.set(String(e));
       console.error("Failed to stop processing:", e);
     }
   }
@@ -115,6 +115,7 @@ function createProgressStore() {
 
   return {
     isProcessing,
+    lastError,
     current,
     total,
     totalOriginalBytes,

@@ -2,11 +2,15 @@
   import { progressStore } from "../stores/progress";
   import { formatFileSize, formatSavings } from "../utils/format";
 
-  const { isProcessing, current, total, percentage, bytePercentage, totalOriginalBytes, processedBytes, results, batchResult, totalSaved } = progressStore;
+  const { isProcessing, lastError, current, total, percentage, bytePercentage, totalOriginalBytes, processedBytes, results, batchResult, totalSaved } = progressStore;
 </script>
 
 <div class="progress-panel">
   <div class="section-title">处理进度</div>
+
+  {#if $lastError}
+    <div class="error-banner" title={$lastError}>{$lastError}</div>
+  {/if}
 
   {#if $isProcessing || $percentage > 0}
     <div class="progress-group">
@@ -73,8 +77,8 @@
       </div>
     </div>
     {#if $batchResult.failed > 0}
-      <div class="log-hint" title="日志文件路径">
-        日志路径: {exe所在目录}\logs\{日期}.log
+      <div class="log-hint">
+        日志: 应用所在目录下 logs\日期.log
       </div>
     {/if}
   {/if}
@@ -194,6 +198,17 @@
   }
   .has-failures {
     color: var(--error);
+  }
+  .error-banner {
+    font-size: 12px;
+    color: var(--error);
+    background: var(--bg-secondary);
+    border: 1px solid var(--error);
+    border-radius: 4px;
+    padding: 4px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .log-hint {
     font-size: 11px;

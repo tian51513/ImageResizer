@@ -1,3 +1,4 @@
+mod batcher;
 mod commands;
 mod config;
 mod memgate;
@@ -9,7 +10,6 @@ mod state;
 use simplelog::{Config, LevelFilter, WriteLogger};
 use state::AppState;
 use std::fs::{self, OpenOptions};
-use std::sync::Mutex;
 
 fn init_logging() {
     let exe_dir = std::env::current_exe()
@@ -40,7 +40,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Mutex::new(AppState::new()))
+        .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::scan_directory,
             commands::get_profiles,

@@ -54,7 +54,7 @@
       </select>
     </div>
     <div class="total-size">
-      总大小: {formatFileSize($totalSize)}
+      总大小: {formatFileSize($filteredFiles.reduce((sum, f) => sum + f.size_bytes, 0))}
     </div>
     <div class="file-list">
       {#each $filteredFiles.slice(0, 200) as file (file.path)}

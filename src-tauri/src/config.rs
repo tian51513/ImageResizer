@@ -159,6 +159,15 @@ pub struct ProgressEvent {
     pub processed_bytes: u64,
 }
 
+/// A time-sliced bundle of progress: latest counters plus every finished
+/// file since the previous batch. Sent instead of one event per file so a
+/// huge batch doesn't flood the IPC channel / frontend renderer.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressBatch {
+    pub last: ProgressEvent,
+    pub results: Vec<ProcessResult>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchResult {
     pub total_files: u32,

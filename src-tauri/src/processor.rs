@@ -44,6 +44,7 @@ impl ImageProcessor {
         input_path: &str,
         output_path: &str,
         profile: &Profile,
+        stop_flag: &AtomicBool,
     ) -> Result<ProcessResult, String> {
         let input = Path::new(input_path);
         log::info!("Processing file: {}", input_path);
@@ -102,7 +103,14 @@ impl ImageProcessor {
         log::info!("  Output format: {:?}, path: {}", effective_format, output_path);
 
         // Encode and save
-        Self::encode_and_save(&resized, output_path, effective_format, &profile.quality, profile.compression)?;
+        Self::encode_and_save(
+            &resized,
+            output_path,
+            effective_format,
+            &profile.quality,
+            profile.compression,
+            stop_flag,
+        )?;
 
         let new_size = std::fs::metadata(output_path)
             .map(|m| m.len())
@@ -209,6 +217,7 @@ impl ImageProcessor {
         format: ImageFormat,
         quality_settings: &QualitySettings,
         tier: CompressionTier,
+        stop_flag: &AtomicBool,
     ) -> Result<(), String> {
         let write = |buf: Vec<u8>| -> Result<(), String> { Self::atomic_write(path, &buf) };
         let dpi = if quality_settings.adjust_dpi {
@@ -230,7 +239,7 @@ impl ImageProcessor {
             QualityMode::TargetSize => {
                 let target_kb = quality_settings.target_size_kb.unwrap_or(100);
                 log::info!("  Saving with target size: {}KB", target_kb);
-                return Self::save_with_target_size(img, path, format, target_kb, tier, dpi);
+                return Self::save_with_target_size(img, path, format, target_kb, tier, dpi, stop_flag);
             }
             QualityMode::Quality => {}
         }
@@ -424,6 +433,7 @@ impl ImageProcessor {
         target_bytes: u64,
         tier: CompressionTier,
         dpi: Option<u32>,
+        stop_flag: &AtomicBool,
     ) -> Result<Vec<u8>, String> {
         let encode = |q: u8| -> Result<Vec<u8>, String> {
             match format {
@@ -437,6 +447,10 @@ impl ImageProcessor {
         let mut high: u8 = 100;
         let mut best: Option<Vec<u8>> = None;
         while low <= high {
+            if stop_flag.load(Ordering::Relaxed) {
+                log::info!("  Target-size search aborted by stop request");
+                break;
+            }
             let mid = (low + high) / 2;
             let buf = encode(mid)?;
             if buf.len() as u64 > target_bytes {
@@ -459,12 +473,13 @@ impl ImageProcessor {
         target_kb: u32,
         tier: CompressionTier,
         dpi: Option<u32>,
+        stop_flag: &AtomicBool,
     ) -> Result<(), String> {
         let target_bytes = (target_kb as u64) * 1024;
 
         match format {
             ImageFormat::Jpeg | ImageFormat::WebP => {
-                let buf = Self::search_quality_for_target(img, format, target_bytes, tier, dpi)?;
+                let buf = Self::search_quality_for_target(img, format, target_bytes, tier, dpi, stop_flag)?;
                 std::fs::write(path, buf).map_err(|e| {
                     log::error!("Write error ({}): {}", path, e);
                     format!("Write error: {}", e)
@@ -684,7 +699,7 @@ impl ImageProcessor {
                 let output_path =
                     Self::compute_output_path(&file.path, source_dir, &profile.output);
 
-                let result = match Self::process_file(&file.path, &output_path, profile) {
+                let result = match Self::process_file(&file.path, &output_path, profile, stop_flag.as_ref()) {
                     Ok(r) => r,
                     Err(e) => {
                         log::error!("FAILED [{}]: {}", file.path, e);
@@ -1085,7 +1100,7 @@ mod tests {
             memory_budget_mb: 1024,
         };
 
-        let result = ImageProcessor::process_file(&input, &output, &profile).unwrap();
+        let result = ImageProcessor::process_file(&input, &output, &profile, &AtomicBool::new(false)).unwrap();
         assert_eq!(result.status, "success");
         assert!(std::path::Path::new(&output).exists());
 
@@ -1252,8 +1267,8 @@ mod tests {
         };
         let low_path = format!("{}\\webp_q20.webp", dir);
         let high_path = format!("{}\\webp_q90.webp", dir);
-        ImageProcessor::encode_and_save(&img, &low_path, ImageFormat::WebP, &qs(20), tier).unwrap();
-        ImageProcessor::encode_and_save(&img, &high_path, ImageFormat::WebP, &qs(90), tier).unwrap();
+        ImageProcessor::encode_and_save(&img, &low_path, ImageFormat::WebP, &qs(20), tier, &AtomicBool::new(false)).unwrap();
+        ImageProcessor::encode_and_save(&img, &high_path, ImageFormat::WebP, &qs(90), tier, &AtomicBool::new(false)).unwrap();
         let low_size = std::fs::metadata(&low_path).unwrap().len();
         let high_size = std::fs::metadata(&high_path).unwrap().len();
         assert!(low_size < high_size, "quality must affect WebP output ({} vs {})", low_size, high_size);
@@ -1273,7 +1288,7 @@ mod tests {
             adjust_dpi: false,
             dpi: 96,
         };
-        ImageProcessor::encode_and_save(&img, &path, ImageFormat::WebP, &qs, CompressionTier::Balanced).unwrap();
+        ImageProcessor::encode_and_save(&img, &path, ImageFormat::WebP, &qs, CompressionTier::Balanced, &AtomicBool::new(false)).unwrap();
         let dec = image::load_from_memory(&fs::read(&path).unwrap())
             .unwrap()
             .to_rgb8();
@@ -1321,11 +1336,31 @@ mod tests {
     }
 
     #[test]
+    fn test_target_size_search_aborts_on_stop() {
+        let img = gradient_photo(400, 300);
+        let stop = Arc::new(AtomicBool::new(true)); // stop already requested
+        let out = ImageProcessor::search_quality_for_target(
+            &img,
+            ImageFormat::WebP,
+            30 * 1024,
+            CompressionTier::Balanced,
+            None,
+            &stop,
+        )
+        .unwrap();
+        // aborted search falls straight to the q1 fallback: valid but tiny output
+        let dec = image::load_from_memory(&out).unwrap();
+        assert_eq!(dec.dimensions(), (400, 300));
+        assert!(out.len() < 8 * 1024, "aborted search must not run the full search, got {} bytes", out.len());
+    }
+
+    #[test]
     fn test_save_with_target_size_webp() {
         let dir = test_output_dir();
         let img = gradient_photo(400, 300);
         let path = format!("{}\\webp_target.webp", dir);
-        ImageProcessor::save_with_target_size(&img, &path, ImageFormat::WebP, 30, CompressionTier::Balanced, None).unwrap();
+        let keep_running = AtomicBool::new(false);
+        ImageProcessor::save_with_target_size(&img, &path, ImageFormat::WebP, 30, CompressionTier::Balanced, None, &keep_running).unwrap();
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size <= 30 * 1024, "output {} must be <= 30KB", size);
         assert!(size > 0);
@@ -1482,7 +1517,7 @@ mod tests {
             memory_budget_mb: 1024,
         };
 
-        let result = ImageProcessor::process_file("/nonexistent/file.jpg", "/tmp/out.jpg", &profile);
+        let result = ImageProcessor::process_file("/nonexistent/file.jpg", "/tmp/out.jpg", &profile, &AtomicBool::new(false));
         assert!(result.is_err());
     }
 }

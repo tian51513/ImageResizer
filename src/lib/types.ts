@@ -62,6 +62,19 @@ export interface ProgressEvent {
   processed_bytes: number;
 }
 
+export interface ProcessResult {
+  file: string;
+  original_size: number;
+  new_size: number;
+  status: string;
+}
+
+/** 时间切片的进度批量：最新计数 + 自上一批以来的全部完成行 */
+export interface ProgressBatch {
+  last: ProgressEvent;
+  results: ProcessResult[];
+}
+
 export interface BatchResult {
   total_files: number;
   success: number;

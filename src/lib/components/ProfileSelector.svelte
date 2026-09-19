@@ -16,7 +16,7 @@
     profilesStore.saveProfile({
       ...current,
       name,
-    });
+    }).catch((e) => alert(`保存方案失败: ${e}`));
   }
 
   function renameProfile() {
@@ -27,15 +27,16 @@
     profilesStore.saveProfile({
       ...current,
       name: newName,
-    });
-    profilesStore.activeProfileName.set(newName);
+    })
+      .then(() => profilesStore.activeProfileName.set(newName))
+      .catch((e) => alert(`重命名方案失败: ${e}`));
   }
 
   function deleteProfile() {
     const current = $activeProfile;
     if (!current) return;
     if (!confirm(`确定要删除方案 "${current.name}" 吗？`)) return;
-    profilesStore.deleteProfile(current.name);
+    profilesStore.deleteProfile(current.name).catch((e) => alert(`删除方案失败: ${e}`));
   }
 </script>
 
