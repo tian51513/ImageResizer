@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod memgate;
+mod platform;
 mod processor;
 mod scanner;
 mod state;

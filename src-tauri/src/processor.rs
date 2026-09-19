@@ -649,10 +649,21 @@ impl ImageProcessor {
         let processed_bytes = Arc::new(AtomicU64::new(0));
         let processed_count = Arc::new(AtomicU64::new(0));
 
-        let results: Vec<ProcessResult> = files
-            .par_iter()
-            .filter_map(|file| {
-                if stop_flag.load(Ordering::Relaxed) {
+        // Dedicated pool: cores-1 workers at below-normal priority, so batch
+        // compression stays a background citizen (full speed when the machine
+        // is idle, yields to foreground apps instantly).
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(crate::platform::worker_thread_count())
+            .build()
+            .map_err(|e| format!("Failed to build worker pool: {}", e))
+            .expect("rayon pool build should not fail");
+
+        let results: Vec<ProcessResult> = pool.install(|| {
+            files
+                .par_iter()
+                .filter_map(|file| {
+                    crate::platform::lower_thread_priority();
+                    if stop_flag.load(Ordering::Relaxed) {
                     processed_bytes.fetch_add(file.size_bytes, Ordering::Relaxed);
                     processed_count.fetch_add(1, Ordering::Relaxed);
                     return Some(ProcessResult {
@@ -702,8 +713,9 @@ impl ImageProcessor {
                 });
 
                 Some(result)
-            })
-            .collect();
+                })
+                .collect()
+        });
 
         let success = results
             .iter()

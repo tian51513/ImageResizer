@@ -21,6 +21,9 @@ jpeg-encoder = "0.7"
 # default-features off: no CLI deps, no internal rayon (batch layer already parallelizes)
 oxipng = { version = "9", default-features = false }
 libwebp-sys = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 rayon = "1.10"
 walkdir = "2"
 dirs = "5"
