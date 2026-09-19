@@ -184,11 +184,11 @@ Rust 后端 (Tauri Core)
 
 配置级固定档位，打包各格式的编码器取舍（存于 `Profile.compression`，旧配置文件缺字段时按"均衡"加载）：
 
-| 档位 | JPEG | PNG (oxipng preset) | WebP | 定位 |
+| 档位 | JPEG | PNG (oxipng preset) | WebP (libwebp method) | 定位 |
 |------|------|--------------------|------|------|
-| 极速 Speed | 基线编码（无优化表） | 1 | 有损 | 最快，实测比旧编码器快 ~2 倍且更小 |
-| 均衡 Balanced（默认） | progressive + 优化 Huffman | 2 | 有损 | 体积/速度兼得 |
-| 极限 Extreme | 同均衡 | 4 | 有损 | PNG 进一步压小 |
+| 极速 Speed | 基线编码（无优化表） | 1 | 有损，method 4 | 最快，实测比旧编码器快 ~2 倍且更小 |
+| 均衡 Balanced（默认） | progressive + 优化 Huffman | 2 | 有损，method 4 | 体积/速度兼得 |
+| 极限 Extreme | 同均衡 | 4 | 有损，**method 6 深压缩**（再小 5-10%，慢 2-3 倍） | 最小体积 |
 
 ### 并发模型
 

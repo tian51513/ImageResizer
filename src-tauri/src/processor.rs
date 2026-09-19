@@ -222,7 +222,7 @@ impl ImageProcessor {
                 log::info!("  Saving with original quality as {:?}", format);
                 return match format {
                     ImageFormat::Jpeg => write(Self::encode_jpeg(img, 95, tier, dpi)?),
-                    ImageFormat::WebP => write(Self::encode_webp(img, None)?),
+                    ImageFormat::WebP => write(Self::encode_webp(img, None, 0)?),
                     ImageFormat::Png => write(Self::encode_png_optimized(img, tier)?),
                     _ => Self::save_dynamic_atomically(img, path, format),
                 };
@@ -251,8 +251,12 @@ impl ImageProcessor {
                 write(Self::encode_png_optimized(img, tier)?)
             }
             ImageFormat::WebP => {
-                log::info!("  Encoding WebP lossy quality={}", quality);
-                write(Self::encode_webp(img, Some(quality as f32))?)
+                log::info!(
+                    "  Encoding WebP lossy quality={} method={}",
+                    quality,
+                    tier.webp_method()
+                );
+                write(Self::encode_webp(img, Some(quality as f32), tier.webp_method())?)
             }
             ImageFormat::Gif => {
                 log::info!("  Encoding GIF");
@@ -292,22 +296,20 @@ impl ImageProcessor {
         Ok(buf)
     }
 
-    /// Encode as WebP via libwebp. `None` = lossless, `Some(q)` = lossy (q clamped 1-100).
-    fn encode_webp(img: &DynamicImage, quality: Option<f32>) -> Result<Vec<u8>, String> {
+    /// Encode as WebP via libwebp. `None` = lossless, `Some(q)` = lossy
+    /// (q clamped 1-100) with the given encoder effort (method 0-6).
+    fn encode_webp(img: &DynamicImage, quality: Option<f32>, method: i32) -> Result<Vec<u8>, String> {
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         let stride = w as i32 * 4;
         let mut out: *mut u8 = std::ptr::null_mut();
         let len = unsafe {
             match quality {
-                Some(q) => libwebp_sys::WebPEncodeRGBA(
-                    rgba.as_raw().as_ptr(),
-                    w as i32,
-                    h as i32,
-                    stride,
-                    q.clamp(1.0, 100.0),
-                    &mut out,
-                ),
+                Some(q) => {
+                    // Lossy through the advanced API so the tier's effort
+                    // (method) is honored; method 4 == simple-API default.
+                    return Self::encode_webp_lossy(&rgba, q, method);
+                }
                 None => libwebp_sys::WebPEncodeLosslessRGBA(
                     rgba.as_raw().as_ptr(),
                     w as i32,
@@ -324,6 +326,58 @@ impl ImageProcessor {
         let bytes = unsafe { std::slice::from_raw_parts(out, len) }.to_vec();
         unsafe { libwebp_sys::WebPFree(out as *mut core::ffi::c_void) };
         Ok(bytes)
+    }
+
+    /// Lossy WebP via WebPConfig/WebPPicture (advanced API) with explicit effort.
+    fn encode_webp_lossy(
+        rgba: &image::RgbaImage,
+        quality: f32,
+        method: i32,
+    ) -> Result<Vec<u8>, String> {
+        let (w, h) = rgba.dimensions();
+        unsafe {
+            let mut config: libwebp_sys::WebPConfig = std::mem::zeroed();
+            let ok = libwebp_sys::WebPConfigInitInternal(
+                &mut config,
+                libwebp_sys::WebPPreset::WEBP_PRESET_DEFAULT,
+                75.0,
+                libwebp_sys::WEBP_ENCODER_ABI_VERSION as core::ffi::c_int,
+            );
+            if ok == 0 {
+                return Err("WebPConfigInit failed".to_string());
+            }
+            config.quality = quality.clamp(1.0, 100.0);
+            config.method = method;
+
+            let mut pic: libwebp_sys::WebPPicture = std::mem::zeroed();
+            if !libwebp_sys::WebPPictureInit(&mut pic) {
+                return Err("WebPPictureInit failed".to_string());
+            }
+            pic.width = w as i32;
+            pic.height = h as i32;
+
+            let mut writer: libwebp_sys::WebPMemoryWriter = std::mem::zeroed();
+            libwebp_sys::WebPMemoryWriterInit(&mut writer);
+            pic.writer = Some(libwebp_sys::WebPMemoryWrite);
+            pic.custom_ptr = &mut writer as *mut _ as *mut core::ffi::c_void;
+
+            let imported = libwebp_sys::WebPPictureImportRGBA(
+                &mut pic,
+                rgba.as_raw().as_ptr(),
+                w as i32 * 4,
+            );
+            let mut bytes: Option<Vec<u8>> = None;
+            if imported != 0 && libwebp_sys::WebPEncode(&config, &mut pic) != 0 {
+                bytes = Some(std::slice::from_raw_parts(writer.mem, writer.size).to_vec());
+            }
+            libwebp_sys::WebPMemoryWriterClear(&mut writer);
+            libwebp_sys::WebPPictureFree(&mut pic);
+
+            bytes.ok_or_else(|| {
+                log::error!("WebP encode failed for {}x{} method={}", w, h, method);
+                "WebP encode failed".to_string()
+            })
+        }
     }
 
     /// Encode as PNG, then losslessly optimize with oxipng (tier preset, safe chunks kept).
@@ -374,7 +428,7 @@ impl ImageProcessor {
         let encode = |q: u8| -> Result<Vec<u8>, String> {
             match format {
                 ImageFormat::Jpeg => Self::encode_jpeg(img, q, tier, dpi),
-                ImageFormat::WebP => Self::encode_webp(img, Some(q as f32)),
+                ImageFormat::WebP => Self::encode_webp(img, Some(q as f32), tier.webp_method()),
                 _ => Err("target-size search unsupported for this format".to_string()),
             }
         };
@@ -1047,8 +1101,8 @@ mod tests {
     #[test]
     fn test_webp_lossy_quality_affects_size() {
         let img = gradient_photo(400, 300);
-        let low = ImageProcessor::encode_webp(&img, Some(20.0)).unwrap();
-        let high = ImageProcessor::encode_webp(&img, Some(90.0)).unwrap();
+        let low = ImageProcessor::encode_webp(&img, Some(20.0), 4).unwrap();
+        let high = ImageProcessor::encode_webp(&img, Some(90.0), 4).unwrap();
         assert!(low.len() < high.len(), "q20 ({}) should be smaller than q90 ({})", low.len(), high.len());
         // both must decode back to the same dimensions
         let dec = image::load_from_memory(&low).unwrap();
@@ -1081,10 +1135,33 @@ mod tests {
     }
 
     #[test]
+    fn test_webp_deep_method_smaller_than_default() {
+        let img = noisy_photo(400, 300);
+        let normal = ImageProcessor::encode_webp(&img, Some(60.0), 4).unwrap();
+        let deep = ImageProcessor::encode_webp(&img, Some(60.0), 6).unwrap();
+        assert!(
+            deep.len() < normal.len(),
+            "method 6 ({}) should be smaller than method 4 ({})",
+            deep.len(),
+            normal.len()
+        );
+        // deep output must decode correctly (advanced-API corruption guard)
+        let (px, w, h) = libwebp_decode_rgba(&deep);
+        assert_eq!((w, h), (400, 300));
+        let orig = img.to_rgba8();
+        let mut total: u64 = 0;
+        for (a, b) in px.iter().zip(orig.as_raw().iter()) {
+            total += (*a as i32 - *b as i32).unsigned_abs() as u64;
+        }
+        let avg = total as f64 / px.len() as f64;
+        assert!(avg < 8.0, "deep WebP avg error too high: {}", avg);
+    }
+
+    #[test]
     fn test_webp_lossy_smaller_than_lossless() {
         let img = noisy_photo(400, 300);
-        let lossy = ImageProcessor::encode_webp(&img, Some(75.0)).unwrap();
-        let lossless = ImageProcessor::encode_webp(&img, None).unwrap();
+        let lossy = ImageProcessor::encode_webp(&img, Some(75.0), 4).unwrap();
+        let lossless = ImageProcessor::encode_webp(&img, None, 4).unwrap();
         assert!(
             lossy.len() < lossless.len(),
             "lossy {} vs lossless {}",
@@ -1214,13 +1291,13 @@ mod tests {
         let orig = img.to_rgba8();
 
         // Lossless output must roundtrip pixel-exact through the reference decoder.
-        let lossless = ImageProcessor::encode_webp(&img, None).unwrap();
+        let lossless = ImageProcessor::encode_webp(&img, None, 4).unwrap();
         let (px, w, h) = libwebp_decode_rgba(&lossless);
         assert_eq!((w, h), (200, 160));
         assert_eq!(px, orig.as_raw().as_slice(), "lossless WebP must be pixel-exact");
 
         // Lossy output must decode with correct dimensions and bounded error.
-        let lossy = ImageProcessor::encode_webp(&img, Some(60.0)).unwrap();
+        let lossy = ImageProcessor::encode_webp(&img, Some(60.0), 6).unwrap();
         let (px, w, h) = libwebp_decode_rgba(&lossy);
         assert_eq!((w, h), (200, 160));
         let mut total: u64 = 0;

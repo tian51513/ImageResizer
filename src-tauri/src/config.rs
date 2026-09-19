@@ -77,6 +77,15 @@ impl CompressionTier {
             CompressionTier::Extreme => 4,
         }
     }
+
+    /// WebP: libwebp encoder effort (0-6, higher = smaller but much slower).
+    /// 4 is the default; Extreme uses slow deep compression.
+    pub fn webp_method(self) -> i32 {
+        match self {
+            CompressionTier::Speed | CompressionTier::Balanced => 4,
+            CompressionTier::Extreme => 6,
+        }
+    }
 }
 
 // ── Structs ──
@@ -319,6 +328,10 @@ mod tests {
         assert!(CompressionTier::Extreme.jpeg_progressive());
         assert!(CompressionTier::Extreme.jpeg_optimized_huffman());
         assert_eq!(CompressionTier::Extreme.oxipng_preset(), 4);
+        // WebP: default method 4, Extreme uses slow deep-compression method 6
+        assert_eq!(CompressionTier::Speed.webp_method(), 4);
+        assert_eq!(CompressionTier::Balanced.webp_method(), 4);
+        assert_eq!(CompressionTier::Extreme.webp_method(), 6);
     }
 
     #[test]
